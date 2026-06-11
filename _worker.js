@@ -2809,8 +2809,7 @@ function getDashboardUI(hasDB) {
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_proto">Primary Display Mode</label>
-                                  <select id="cfg-proto" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
-                                      <option value="alpha">Alpha Mode (V-Core)</option>
+                                  <select id="cfg-proto" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">                                      <option value="alpha">Alpha Mode (V-Core)</option>
                                       <option value="beta">Beta Mode (T-Core)</option>
                                       <option value="both">Both (V-Core & T-Core)</option>
                                   </select>
