@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.4.9";
+const CURRENT_VERSION = "2.5.1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -44,6 +44,7 @@ const SYSTEM_DEFAULTS = {
     enableOpt2: false,
     tgToken: "",
     tgChatId: "",
+    tgAdminId: "",
     cfAccountId: "",
     cfApiToken: "",
     isPaused: false,
@@ -57,6 +58,8 @@ const SYSTEM_DEFAULTS = {
     customPanelUrl: "",
     limitTotalReq: 0,
     expiryMs: 0,
+    linkedPanels: [],
+    hubPanelUrl: "",
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -149,18 +152,36 @@ function trackUsage(uuid, bytes, env, ctx) {
         if (env && env.IOT_DB) {
             let changedConfig = false;
             if (sysConfig.users && sysConfig.users.length > 0) {
-                const initialLen = sysConfig.users.length;
-                sysConfig.users = sysConfig.users.filter(u => {
+                sysConfig.users.forEach(u => {
                     let uId = u.id.replace(/-/g, '').toLowerCase();
                     let sysU = sysUsageCache.users[uId];
-                    if (sysU) {
-                        if (u.limitTotalReq && sysU.reqs >= u.limitTotalReq) return false;
+                    if (!u.isPaused) {
+                        let reason = null;
+                        if (u.expiryMs && Date.now() > u.expiryMs) {
+                            reason = `Expiration date reached (${new Date(u.expiryMs).toLocaleDateString()})`;
+                        } else if (sysU && u.limitTotalReq && sysU.reqs >= u.limitTotalReq) {
+                            let usedGB = (sysU.reqs / 6000).toFixed(2);
+                            let limitGB = (u.limitTotalReq / 6000).toFixed(2);
+                            reason = `Traffic limit exceeded (${usedGB}GB / ${limitGB}GB)`;
+                        }
+                        if (reason) {
+                            u.isPaused = true;
+                            u.disabledReason = reason;
+                            u.disabledAt = Date.now();
+                            changedConfig = true;
+                            ctx?.waitUntil(logActivity(env, "User Auto-Disabled", `User "${u.name}" (${u.id}) disabled: ${reason}`).catch(()=>{}));
+                            if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
+                                const tgMsg = `⚠️ <b>User Auto-Disabled</b>\n\n👤 <b>User:</b> ${u.name}\n🆔 <b>ID:</b> <code>${u.id}</code>\n📝 <b>Reason:</b> ${reason}`;
+                                const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
+                                ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
+                                }).catch(()=>{}));
+                            }
+                        }
                     }
-                    return true;
                 });
-                if (sysConfig.users.length !== initialLen) {
-                    changedConfig = true;
-                }
             }
             
             if (changedConfig) {
@@ -190,11 +211,16 @@ export default {
                 auth: `/${encodeURI(sysConfig.apiRoute)}/api/auth`,
                 sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
                 tg: `/${encodeURI(sysConfig.apiRoute)}/tg`,
+                syncPanel: `/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`,
                 logs: `/${encodeURI(sysConfig.apiRoute)}/api/logs`,
+                users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
+                stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.logs || isSyncRoute;
+            const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
+            const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -215,6 +241,16 @@ export default {
                 if (reqPath === routes.logs) {
                     if (request.method !== "POST" && request.method !== "GET") return new Response("405", { status: 405 });
                     return await handleLogs(request, env);
+                }
+                if (isUsersRoute) {
+                    return await handleUsersApi(request, env, ctx);
+                }
+                if (isStatsRoute) {
+                    return await handleStatsApi(request, env);
+                }
+                if (reqPath === routes.syncPanel) {
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleSyncPanel(request, env);
                 }
                 if (reqPath === routes.tg) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -685,7 +721,7 @@ async function fetchCloudflareUsage(accountId, apiToken) {
 }
 
 async function sendTelegramMessage(request, type) {
-    if (!sysConfig.tgToken || !sysConfig.tgChatId) return;
+    if (!sysConfig.tgToken || !(sysConfig.tgAdminId || sysConfig.tgChatId)) return;
 
     let usageStr = "نامشخص (0.00%)";
     if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
@@ -726,12 +762,13 @@ async function sendTelegramMessage(request, type) {
     const panelUrl = `https://${domain}/${encodeURI(sysConfig.apiRoute)}/dash`;
 
     const tgUrl = `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`;
+    const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
     try {
         await fetch(tgUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                chat_id: sysConfig.tgChatId,
+                chat_id: notifyChatId,
                 text: text,
                 parse_mode: 'HTML',
                 reply_markup: {
@@ -777,6 +814,195 @@ async function handleLogs(request, env) {
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
 
+async function handleUsersApi(request, env, ctx) {
+    try {
+        const url = new URL(request.url);
+        const method = request.method;
+        const userId = url.searchParams.get("id");
+        const action = url.searchParams.get("action");
+
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        let bodyKey = "";
+        if (method === "POST" || method === "PUT") {
+            try {
+                const body = await request.clone().json();
+                bodyKey = body.key || "";
+            } catch(e) {}
+        }
+        const isAuth = (authKey === sysConfig.masterKey) || (bodyKey === sysConfig.masterKey);
+        if (!isAuth) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "GET" && !userId) {
+            const q = url.searchParams.get("q") || "";
+            let users = sysConfig.users || [];
+            if (q) {
+                const ql = q.toLowerCase();
+                users = users.filter(u => u.name.toLowerCase().includes(ql) || u.id.toLowerCase().includes(ql) || (u.notes && u.notes.toLowerCase().includes(ql)));
+            }
+            const enriched = users.map(u => {
+                const idClean = u.id.replace(/-/g, '').toLowerCase();
+                const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+                const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
+                const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
+                const isExpired = u.expiryMs && Date.now() > u.expiryMs;
+                let status = "active";
+                if (u.isPaused && u.disabledReason) status = "auto-disabled";
+                else if (u.isPaused) status = "paused";
+                else if (isExpired) status = "expired";
+                return { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status };
+            });
+            return new Response(JSON.stringify({ success: true, users: enriched, total: enriched.length }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "GET" && userId) {
+            const u = (sysConfig.users || []).find(usr => usr.id === userId || usr.name.toLowerCase() === userId.toLowerCase());
+            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            const idClean = u.id.replace(/-/g, '').toLowerCase();
+            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+            const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
+            const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
+            const isExpired = u.expiryMs && Date.now() > u.expiryMs;
+            let status = "active";
+            if (u.isPaused && u.disabledReason) status = "auto-disabled";
+            else if (u.isPaused) status = "paused";
+            else if (isExpired) status = "expired";
+            const hostName = new URL(request.url).hostname;
+            const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
+            return new Response(JSON.stringify({ success: true, user: { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status, subscriptionUrl: subUrl } }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "POST" && !userId) {
+            const body = await request.json();
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, userMode, userPorts } = body;
+            if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const newId = crypto.randomUUID();
+            const newUser = {
+                id: newId,
+                name: name,
+                limitTotalReq: trafficLimit ? Math.floor(parseFloat(trafficLimit) * 6000) : null,
+                limitDailyReq: body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null,
+                expiryMs: expiryDays ? Date.now() + parseInt(expiryDays) * 86400000 : null,
+                notes: notes || "",
+                maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
+                proxyIp: proxyIp || null,
+                userMode: userMode || null,
+                userPorts: userPorts || null,
+                createdAt: Date.now()
+            };
+            if (!sysConfig.users) sysConfig.users = [];
+            sysConfig.users.push(newUser);
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Created", `User "${name}" (${newId}) created via API`).catch(()=>{}));
+            const hostName = new URL(request.url).hostname;
+            const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(name)}`;
+            return new Response(JSON.stringify({ success: true, user: newUser, subscriptionUrl: subUrl }), { status: 201, headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "PUT" && userId) {
+            const body = await request.json();
+            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const u = sysConfig.users.find(usr => usr.id === userId);
+            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            if (body.name !== undefined) u.name = body.name;
+            if (body.trafficLimit !== undefined) u.limitTotalReq = body.trafficLimit ? Math.floor(parseFloat(body.trafficLimit) * 6000) : null;
+            if (body.dailyLimit !== undefined) u.limitDailyReq = body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null;
+            if (body.expiryDays !== undefined) u.expiryMs = body.expiryDays ? Date.now() + parseInt(body.expiryDays) * 86400000 : null;
+            if (body.notes !== undefined) u.notes = body.notes;
+            if (body.maxConfigs !== undefined) u.maxConfigs = body.maxConfigs ? parseInt(body.maxConfigs) : null;
+            if (body.proxyIp !== undefined) u.proxyIp = body.proxyIp;
+            if (body.userMode !== undefined) u.userMode = body.userMode;
+            if (body.userPorts !== undefined) u.userPorts = body.userPorts;
+            if (body.status !== undefined) {
+                if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
+                else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
+            }
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Updated", `User "${u.name}" (${userId}) updated via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "DELETE" && userId) {
+            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const idx = sysConfig.users.findIndex(usr => usr.id === userId);
+            if (idx === -1) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            const deleted = sysConfig.users.splice(idx, 1)[0];
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Deleted", `User "${deleted.name}" (${userId}) deleted via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, deleted: deleted.id }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "POST" && userId && action === "toggle") {
+            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const u = sysConfig.users.find(usr => usr.id === userId);
+            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            u.isPaused = !u.isPaused;
+            if (!u.isPaused) { u.disabledReason = null; u.disabledAt = null; }
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Toggled", `User "${u.name}" (${userId}) ${u.isPaused ? 'paused' : 'resumed'} via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "POST" && userId && action === "reset") {
+            if (!sysUsageCache) sysUsageCache = { users: {} };
+            if (!sysUsageCache.users) sysUsageCache.users = {};
+            const uuidClean = userId.replace(/-/g, '').toLowerCase();
+            if (sysUsageCache.users[uuidClean]) {
+                sysUsageCache.users[uuidClean].reqs = 0;
+                sysUsageCache.users[uuidClean].dReqs = 0;
+            } else {
+                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+            }
+            await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            ctx?.waitUntil(logActivity(env, "Traffic Reset", `Traffic reset for user ${userId} via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, message: "Traffic reset" }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({ success: false, error: "Invalid request" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
+}
+
+async function handleStatsApi(request, env) {
+    try {
+        const url = new URL(request.url);
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        if (authKey !== sysConfig.masterKey) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        const users = sysConfig.users || [];
+        const totalUsers = users.length;
+        const activeUsers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+        const autoDisabledUsers = users.filter(u => u.isPaused && u.disabledReason).length;
+        const pausedUsers = users.filter(u => u.isPaused && !u.disabledReason).length;
+        const expiredUsers = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
+
+        let totalTrafficReqs = 0;
+        let dailyTrafficReqs = 0;
+        const todayDate = new Date().toISOString().split('T')[0];
+        users.forEach(u => {
+            const idClean = u.id.replace(/-/g, '').toLowerCase();
+            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+            totalTrafficReqs += (sysU.reqs || 0);
+            if (sysU.lastDay === todayDate) dailyTrafficReqs += (sysU.dReqs || 0);
+        });
+
+        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
+
+        return new Response(JSON.stringify({
+            success: true,
+            stats: {
+                users: { total: totalUsers, active: activeUsers, paused: pausedUsers, expired: expiredUsers, autoDisabled: autoDisabledUsers },
+                traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficReqs / 6000).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficReqs / 6000).toFixed(2) },
+                system: { uptimeSeconds: upSeconds, activeConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false }
+            }
+        }), { headers: { "Content-Type": "application/json" } });
+    } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
+}
+
 async function handleAuth(request, hostName, ctx, env) {
     try {
         const data = await request.json();
@@ -784,6 +1010,42 @@ async function handleAuth(request, hostName, ctx, env) {
         if (data.key === sysConfig.masterKey) {
             ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
             if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)"));
+
+            // Store login signal for Telegram bot
+            if (sysConfig.tgAdminId && env.IOT_DB) {
+                const loginSignal = {
+                    name: sysConfig.name || hostName,
+                    host: hostName,
+                    apiRoute: sysConfig.apiRoute,
+                    masterKey: sysConfig.masterKey,
+                    isLocal: true,
+                    ts: Date.now()
+                };
+                ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(() => {}));
+            }
+
+            // Notify hub panel if configured
+            if (sysConfig.hubPanelUrl && sysConfig.hubPanelUrl.trim() && sysConfig.tgAdminId) {
+                try {
+                    let hubUrl = sysConfig.hubPanelUrl.trim();
+                    if (!hubUrl.startsWith('http')) hubUrl = 'https://' + hubUrl;
+                    const signalPayload = {
+                        signal: "panel_login",
+                        panelName: sysConfig.name || hostName,
+                        panelHost: hostName,
+                        panelApiRoute: sysConfig.apiRoute,
+                        panelMasterKey: sysConfig.masterKey,
+                        tgAdminId: sysConfig.tgAdminId,
+                        ts: Date.now()
+                    };
+                    ctx?.waitUntil(fetch(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(signalPayload)
+                    }).catch(() => {}));
+                } catch(e) {}
+            }
+
             const netInfo = {
                 ip: ip,
                 colo: request.cf?.colo || "Unknown",
@@ -880,6 +1142,37 @@ async function handleConfigSync(request, env, ctx) {
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
 
+async function handleSyncPanel(request, env) {
+    try {
+        const data = await request.json();
+        if (!data.signal || data.signal !== "panel_login") {
+            return new Response(JSON.stringify({ success: false, error: "Invalid signal" }), { status: 400 });
+        }
+        if (!data.tgAdminId || !data.panelHost) {
+            return new Response(JSON.stringify({ success: false, error: "Missing fields" }), { status: 400 });
+        }
+        // Verify the tgAdminId matches this panel's config
+        const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
+        if (!adminId || adminId.toString() !== data.tgAdminId.toString()) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401 });
+        }
+        const loginSignal = {
+            name: data.panelName || data.panelHost,
+            host: data.panelHost,
+            apiRoute: data.panelApiRoute || sysConfig.apiRoute,
+            masterKey: data.panelMasterKey,
+            isLocal: false,
+            ts: data.ts || Date.now()
+        };
+        if (env.IOT_DB) {
+            await d1Put(env, "tg_panel_login", JSON.stringify(loginSignal));
+        }
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+    } catch (e) {
+        return new Response(JSON.stringify({ success: false }), { status: 400 });
+    }
+}
+
 const botI18n = {
     en: {
         welcome: "🤖 **Welcome to Nahan Gateway Bot**\nSelect your option below to manage your system:",
@@ -920,7 +1213,50 @@ const botI18n = {
         msg_enter_limits: "Enter limits format:\n`[totalReqs] [dailyReqs] [days_limit]`\n(Use 0 for unlimited)\n\nExample:\n`10000 500 30`",
         msg_confirm_del: "⚠️ Are you sure you want to delete this subscriber?",
         msg_confirm_panic: "⚠️ Are you absolutely sure you want to trigger PANIC mode? This will randomize API routes and pause all connections!",
-        status_updated: "Status updated! 🔁"
+        status_updated: "Status updated! 🔁",
+        access_denied: "❌ Access Denied. You are not authorized to manage this panel.",
+        dashboard: "📊 Dashboard",
+        search: "🔍 Search User",
+        statistics: "📈 Statistics",
+        panel_info: "ℹ️ Panel Info",
+        disabled_users: "🚫 Disabled Users",
+        reset_traffic: "🔄 Reset Traffic",
+        extend_expiry: "📅 Extend Expiry",
+        notes: "📝 Notes",
+        device_limit: "📱 Device Limit",
+        msg_enter_search: "🔍 Send a username, UUID, or subscription to search:",
+        msg_enter_notes: "📝 Send notes for this user:",
+        msg_enter_extend_days: "📅 Enter number of days to extend expiration:",
+        msg_traffic_reset: "✅ Traffic has been reset successfully!",
+        msg_expiry_extended: "✅ Expiration extended by {days} days!",
+        msg_no_disabled: "No disabled users found.",
+        msg_enter_device_limit: "📱 Enter device limit (0 for unlimited):",
+        stats_title: "📈 Panel Statistics",
+        count_active: "active",
+        count_paused: "paused",
+        count_disabled: "auto-disabled",
+        dash_total: "Total Users",
+        dash_active: "Active",
+        dash_paused: "Paused",
+        dash_expired: "Expired",
+        dash_auto_disabled: "Auto-Disabled",
+        btn_main_menu: "🔙 Main Menu",
+        btn_back_to_list: "🔙 Back to List",
+        total_traffic: "Total Traffic",
+        daily_traffic: "Daily Traffic",
+        lbl_status: "Status",
+        lbl_subscription: "Subscription Connection",
+        lbl_user_not_found: "⚠️ User not found",
+        lbl_none: "None",
+        lbl_page: "Page",
+        select_panel: "🔌 Which panel do you want to manage?",
+        current_panel: "Current Panel",
+        switch_panel: "🔄 Switch Panel",
+        panel_local: "🏠 This Panel",
+        panel_remote: "🌐",
+        msg_panel_selected: "Panel selected! ✅",
+        msg_panel_error: "❌ Failed to connect to the selected panel.",
+        msg_panel_unreachable: "⚠️ Panel is unreachable. Please check the configuration.",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
@@ -961,24 +1297,179 @@ const botI18n = {
         msg_enter_limits: "فرمت ورودی محدودیت:\n`[کل] [روزانه] [مدت_روز]`\n(از 0 برای نامحدود استفاده کنید)\n\nمثال:\n`10000 500 30`",
         msg_confirm_del: "⚠️ آیا از حذف این مشترک اطمینان کامل دارید؟",
         msg_confirm_panic: "⚠️ آیا از فعال‌سازی وضعیت اضطراری اطمینان دارید؟ کل اتصالات متوقف و آدرس‌ها منقضی خواهند شد!",
-        status_updated: "وضعیت بروزرسانی شد! 🔁"
+        status_updated: "وضعیت بروزرسانی شد! 🔁",
+        access_denied: "❌ دسترسی غیرمجاز. شما اجازه مدیریت این پنل را ندارید.",
+        dashboard: "📊 داشبورد",
+        search: "🔍 جستجوی کاربر",
+        statistics: "📈 آمار",
+        panel_info: "ℹ️ اطلاعات پنل",
+        disabled_users: "🚫 کاربران غیرفعال",
+        reset_traffic: "🔄 بازنشانی ترافیک",
+        extend_expiry: "📅 تمدید انقضا",
+        notes: "📝 یادداشت‌ها",
+        device_limit: "📱 محدودیت دستگاه",
+        msg_enter_search: "🔍 نام کاربری، UUID یا لینک اشتراک را ارسال کنید:",
+        msg_enter_notes: "📝 یادداشت برای این کاربر را ارسال کنید:",
+        msg_enter_extend_days: "📅 تعداد روزهای تمدید را وارد کنید:",
+        msg_traffic_reset: "✅ ترافیک با موفقیت بازنشانی شد!",
+        msg_expiry_extended: "✅ انقضا به مدت {days} روز تمدید شد!",
+        msg_no_disabled: "هیچ کاربر غیرفعالی یافت نشد.",
+        msg_enter_device_limit: "📱 محدودیت دستگاه را وارد کنید (0 برای نامحدود):",
+        stats_title: "📈 آمار پنل",
+        count_active: "فعال",
+        count_paused: "متوقف",
+        count_disabled: "غیرفعال خودکار",
+        dash_total: "کل کاربران",
+        dash_active: "فعال",
+        dash_paused: "متوقف",
+        dash_expired: "منقضی",
+        dash_auto_disabled: "غیرفعال خودکار",
+        btn_main_menu: "🔙 منوی اصلی",
+        btn_back_to_list: "🔙 بازگشت به لیست",
+        total_traffic: "ترافیک کل",
+        daily_traffic: "ترافیک روزانه",
+        lbl_status: "وضعیت",
+        lbl_subscription: "لینک اشتراک",
+        lbl_user_not_found: "⚠️ کاربر یافت نشد",
+        lbl_none: "ندارد",
+        lbl_page: "صفحه",
+        select_panel: "🔌 کدام پنل را می‌خواهید مدیریت کنید؟",
+        current_panel: "پنل فعلی",
+        switch_panel: "🔄 تغییر پنل",
+        panel_local: "🏠 این پنل",
+        panel_remote: "🌐",
+        msg_panel_selected: "پنل انتخاب شد! ✅",
+        msg_panel_error: "❌ اتصال به پنل انتخابی ناموفق بود.",
+        msg_panel_unreachable: "⚠️ پنل در دسترس نیست. لطفاً پیکربندی را بررسی کنید.",
     }
 };
+
+function getPanelsList() {
+    const panels = [];
+    panels.push({
+        name: sysConfig.name || "Main Panel",
+        host: null,
+        apiRoute: sysConfig.apiRoute,
+        masterKey: null,
+        isLocal: true
+    });
+    if (sysConfig.linkedPanels && Array.isArray(sysConfig.linkedPanels)) {
+        sysConfig.linkedPanels.forEach(p => {
+            if (p && p.host) {
+                panels.push({
+                    name: p.name || p.host,
+                    host: p.host,
+                    apiRoute: p.apiRoute || sysConfig.apiRoute,
+                    masterKey: p.masterKey,
+                    isLocal: false
+                });
+            }
+        });
+    }
+    return panels;
+}
+
+async function remotePanelFetch(panel, method, path, body = null) {
+    try {
+        const url = `https://${panel.host}/${encodeURI(panel.apiRoute)}${path}`;
+        const options = {
+            method,
+            headers: { 'Content-Type': 'application/json' }
+        };
+        if (body) options.body = JSON.stringify(body);
+        const res = await fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
+        return await res.json();
+    } catch(e) {
+        return { success: false, error: e.message };
+    }
+}
+
+async function fetchRemotePanelUsers(panel) {
+    return await remotePanelFetch(panel, 'GET', `/api/users?key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function fetchRemotePanelUser(panel, userId) {
+    return await remotePanelFetch(panel, 'GET', `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function fetchRemotePanelStats(panel) {
+    return await remotePanelFetch(panel, 'GET', `/api/stats?key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function fetchRemotePanelConfig(panel) {
+    return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.masterKey });
+}
+
+async function remotePanelWriteAction(panel, method, userId, body = null) {
+    let path = '/api/users';
+    if (userId) path += `?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`;
+    else path += `?key=${encodeURIComponent(panel.masterKey)}`;
+    return await remotePanelFetch(panel, method, path, body || { key: panel.masterKey });
+}
+
+async function remotePanelToggleUser(panel, userId) {
+    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=toggle&key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function remotePanelResetTraffic(panel, userId) {
+    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=reset&key=${encodeURIComponent(panel.masterKey)}`);
+}
 
 async function handleTelegramWebhook(request, env, hostName, ctx) {
     try {
         const update = await request.json();
         const tgApi = `https://api.telegram.org/bot${sysConfig.tgToken}`;
-        
+
+        const langCode = sysConfig.tgBotLang || "fa";
+        const t = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
+
+        const callerId = update.callback_query?.from?.id?.toString() || update.message?.from?.id?.toString();
+        const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
+        const isAuthorized = adminId && callerId === adminId.toString();
+
+        if (!isAuthorized && callerId) {
+            const chatId = update.callback_query?.message?.chat?.id || update.message?.chat?.id;
+            if (chatId) {
+                await fetch(`${tgApi}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_id: chatId, text: t("access_denied") })
+                });
+            }
+            return new Response("OK", { status: 200 });
+        }
+
         let tgState = {};
         try {
             const storedState = await d1Get(env, "tg_bot_state");
             if (storedState) tgState = JSON.parse(storedState);
         } catch (e) { }
 
-        // Determine language code (default to Persian)
-        const langCode = sysConfig.tgBotLang || "fa";
-        const t = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
+        const panels = getPanelsList();
+
+        // Read last login signal from D1 (set by handleAuth or handleSyncPanel)
+        let lastLoginPanel = null;
+        try {
+            const stored = await d1Get(env, "tg_panel_login");
+            if (stored) lastLoginPanel = JSON.parse(stored);
+        } catch (e) { }
+
+        const getActivePanel = () => {
+            if (lastLoginPanel) {
+                if (lastLoginPanel.isLocal) return panels.find(p => p.isLocal) || panels[0];
+                const found = panels.find(p => !p.isLocal && p.host === lastLoginPanel.host);
+                if (found) return found;
+                // Remote panel not in linkedPanels — synthesize from login signal
+                return {
+                    name: lastLoginPanel.name || lastLoginPanel.host,
+                    host: lastLoginPanel.host,
+                    apiRoute: lastLoginPanel.apiRoute || sysConfig.apiRoute,
+                    masterKey: lastLoginPanel.masterKey,
+                    isLocal: false
+                };
+            }
+            return panels[0]; // default to local
+        };
 
         // Custom sendOrEdit message helper
         const sendOrEdit = async (chatId, text, replyMarkup = null, messageId = null) => {
@@ -1010,45 +1501,67 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             return res;
         };
 
-        const getMainMenu = () => {
+        const getMainMenu = (activePanel) => {
             const isPaused = sysConfig.isPaused || false;
             const statusEmoji = isPaused ? "🔴" : "🟢";
-            const text = `${t("welcome")}\n\n` +
+            const users = sysConfig.users || [];
+            const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+            const pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+            const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+            const isLocal = !activePanel || activePanel.isLocal;
+            const panelName = activePanel ? activePanel.name : (sysConfig.name || "Main Panel");
+            const panelIndicator = isLocal ? `🏠 ${panelName}` : `🌐 ${panelName}`;
+            let text = `${t("welcome")}\n\n` +
                          `━━━━━━━━━━━━━━━━\n` +
+                         `📌 **${t("current_panel")}**: ${panelIndicator}\n` +
                          `⚡ **${t("status")}**: ${isPaused ? t("paused") : t("active")} ${statusEmoji}\n` +
-                         `👥 **${t("users")}**: ${sysConfig.users?.length || 0}\n` +
+                         `👥 **${t("users")}**: ${users.length} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")}, ${autoDisabledCount} ${t("count_disabled")})\n` +
                          `━━━━━━━━━━━━━━━━`;
-            const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
+            const panelUrl = isLocal ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash` : null;
             const kb = {
                 inline_keyboard: [
                     [
-                        { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-                        { text: isPaused ? "▶️ Resume" : "⏸️ Pause", callback_data: "sys_toggle_status" }
-                    ],
-                    [
                         { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
-                        { text: `📡 ${t("metrics")}`, callback_data: "sys_metrics" }
+                        { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" }
                     ],
                     [
-                        { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } }
+                        { text: `📊 ${t("dashboard")}`, callback_data: "sys_dashboard" },
+                        { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
                     ],
                     [
-                        { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
+                        { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
+                    ],
+                    [
+                        { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
+                        { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
                     ]
                 ]
             };
+            if (panelUrl) {
+                kb.inline_keyboard.push([
+                    { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
+                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
+                ]);
+                kb.inline_keyboard.push([
+                    { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
+                ]);
+            } else {
+                kb.inline_keyboard.push([
+                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
+                ]);
+            }
             return { text, kb };
         };
 
-        const getSubsList = (page = 0) => {
-            const users = sysConfig.users || [];
+        const getSubsList = (page = 0, usersList = null) => {
+            const users = usersList || sysConfig.users || [];
             const itemsPerPage = 5;
             const totalPages = Math.ceil(users.length / itemsPerPage);
             const start = page * itemsPerPage;
             const end = start + itemsPerPage;
             const pageUsers = users.slice(start, end);
             
-            let text = `👥 **${t("users")}** (Page ${page + 1}/${Math.max(1, totalPages)})\n`;
+            let text = `👥 **${t("users")}** (${t("lbl_page")} ${page + 1}/${Math.max(1, totalPages)})\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             
             if (users.length === 0) {
@@ -1077,16 +1590,16 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             }
             
             inline_keyboard.push([{ text: `➕ ${t("btn_add")}`, callback_data: "sub_add_init" }]);
-            inline_keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
             
             return { text, kb: { inline_keyboard } };
         };
 
-        const getSubDetail = (uuid) => {
-            const users = sysConfig.users || [];
+        const getSubDetail = (uuid, usersList = null) => {
+            const users = usersList || sysConfig.users || [];
             const u = users.find(usr => usr.id === uuid);
             if (!u) {
-                return { text: "⚠️ User not found", kb: { inline_keyboard: [[{ text: "Back", callback_data: "subs_list:0" }]] } };
+                return { text: "⚠️ User not found", kb: { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] } };
             }
             
             const sysU = sysUsageCache?.users?.[u.id.replace(/-/g,'').toLowerCase()] || { reqs: 0, dReqs: 0, lastDay: '' };
@@ -1096,32 +1609,42 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             
             const limitTotalTxt = u.limitTotalReq ? `${u.limitTotalReq}` : t("unlimited");
             const limitDailyTxt = u.limitDailyReq ? `${u.limitDailyReq}` : t("unlimited");
+            const usedGB = (userReqs / 6000).toFixed(2);
+            const limitGB = u.limitTotalReq ? (u.limitTotalReq / 6000).toFixed(2) : t("unlimited");
             
             let expTxt = t("unlimited");
             let isExp = false;
+            let daysLeft = t("unlimited");
             if (u.expiryMs) {
                 const date = new Date(u.expiryMs);
                 expTxt = date.toLocaleDateString();
+                const remDays = Math.ceil((u.expiryMs - Date.now()) / 86400000);
+                daysLeft = remDays >= 0 ? `${remDays}` : '0';
                 if (Date.now() > u.expiryMs) {
-                    expTxt += ` (${langCode === 'fa' ? 'منقضی شده 🔴' : 'Expired 🔴'})`;
+                    expTxt += ` (${t("dash_expired")} 🔴)`;
                     isExp = true;
                 }
             }
             
             const statusEmoji = u.isPaused ? "⏸️" : (isExp ? "🔴" : "🟢");
-            const statusText = u.isPaused ? t("paused") : (isExp ? (langCode==='fa'?'منقضی':'Expired') : t("active"));
+            const statusText = u.isPaused ? t("paused") : (isExp ? t("dash_expired") : t("active"));
             const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
+            const maxCfgTxt = u.maxConfigs || t("unlimited");
+            const notesTxt = u.notes || t("lbl_none");
             
             let text = `👤 **${t("sub_info")}**\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `📛 **${t("name")}**: ${u.name}\n`;
             text += `🆔 **UUID**: <code>${u.id}</code>\n`;
-            text += `🚦 **Status**: ${statusEmoji} ${statusText}\n`;
-            text += `📊 **${t("total")}**: ${userReqs} / ${limitTotalTxt}\n`;
+            text += `🚦 **${t("lbl_status")}**: ${statusEmoji} ${statusText}\n`;
+            text += `📊 **${t("total")}**: ${usedGB} GB / ${limitGB} GB (${userReqs} reqs)\n`;
             text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
             text += `📅 **${t("expiry")}**: ${expTxt}\n`;
+            text += `⏳ **${t("days")}**: ${daysLeft}\n`;
+            text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
+            text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
-            text += `🔗 **Subscription Connection:**\n<code>${subSync}</code>`;
+            text += `🔗 **${t("lbl_subscription")}:**\n<code>${subSync}</code>`;
             
             const kb = {
                 inline_keyboard: [
@@ -1134,7 +1657,15 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         { text: `⚙️ ${t("btn_edit_limits")}`, callback_data: `sub_edit_limits_init:${u.id}` }
                     ],
                     [
-                        { text: "🔙 Back to List", callback_data: "subs_list:0" }
+                        { text: `🔄 ${t("reset_traffic")}`, callback_data: `sub_reset_traffic:${u.id}` },
+                        { text: `📅 ${t("extend_expiry")}`, callback_data: `sub_extend_init:${u.id}` }
+                    ],
+                    [
+                        { text: `📝 ${t("notes")}`, callback_data: `sub_edit_notes_init:${u.id}` },
+                        { text: `📱 ${t("device_limit")}`, callback_data: `sub_edit_device_init:${u.id}` }
+                    ],
+                    [
+                        { text: t("btn_back_to_list"), callback_data: "subs_list:0" }
                     ]
                 ]
             };
@@ -1148,22 +1679,35 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const data = cb.data;
 
             if (chatId) {
-                // Clear state on callback query to keep bot highly responsive and intuitive
+                // Get active panel from last login signal
+                const activePanel = getActivePanel();
+                const isRemotePanel = activePanel && !activePanel.isLocal;
+
+                // Helper to fetch users for the active panel
+                const getPanelUsers = async () => {
+                    if (isRemotePanel) {
+                        const res = await fetchRemotePanelUsers(activePanel);
+                        return res.success ? (res.users || []) : null;
+                    }
+                    return sysConfig.users || [];
+                };
+
+                // Clear step state on callback query
                 tgState[chatId] = null;
-                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)));
+                await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
 
                 if (data === "main_menu") {
-                    const menu = getMainMenu();
+                    const menu = getMainMenu(activePanel);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_lang") {
                     sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu();
+                    const menu = getMainMenu(activePanel);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_toggle_status") {
                     sysConfig.isPaused = !sysConfig.isPaused;
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu();
+                    const menu = getMainMenu(activePanel);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_metrics") {
                     let usageStr = t("unlimited");
@@ -1185,30 +1729,44 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     text += `📊 **Cloudflare API Usage**: ${usageStr}\n`;
                     text += `━━━━━━━━━━━━━━━━`;
                     
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("subs_list:")) {
                     const page = parseInt(data.replace("subs_list:", "")) || 0;
-                    const list = getSubsList(page);
-                    await sendOrEdit(chatId, list.text, list.kb, messageId);
+                    const panelUsers = await getPanelUsers();
+                    if (panelUsers === null && isRemotePanel) {
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                    } else {
+                        const list = getSubsList(page, panelUsers);
+                        await sendOrEdit(chatId, list.text, list.kb, messageId);
+                    }
                 } else if (data.startsWith("sub_detail:")) {
                     const uuid = data.replace("sub_detail:", "");
-                    const detail = getSubDetail(uuid);
-                    await sendOrEdit(chatId, detail.text, detail.kb, messageId);
+                    const panelUsers = await getPanelUsers();
+                    if (panelUsers === null && isRemotePanel) {
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                    } else {
+                        const detail = getSubDetail(uuid, panelUsers);
+                        await sendOrEdit(chatId, detail.text, detail.kb, messageId);
+                    }
                 } else if (data.startsWith("sub_toggle:")) {
                     const uuid = data.replace("sub_toggle:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelToggleUser(activePanel, uuid);
+                    } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.isPaused = !u.isPaused;
                             await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
-                    const detail = getSubDetail(uuid);
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, detail.text, detail.kb, messageId);
                 } else if (data.startsWith("sub_del_init:")) {
                     const uuid = data.replace("sub_del_init:", "");
-                    const u = sysConfig.users?.find(usr => usr.id === uuid);
+                    const panelUsers = await getPanelUsers();
+                    const u = panelUsers?.find(usr => usr.id === uuid);
                     const name = u ? u.name : "";
                     const text = `${t("msg_confirm_del")}\n\n👤 **${name}**`;
                     const kb = {
@@ -1222,7 +1780,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_del_confirm:")) {
                     const uuid = data.replace("sub_del_confirm:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelWriteAction(activePanel, 'DELETE', uuid);
+                    } else if (sysConfig.users) {
                         sysConfig.users = sysConfig.users.filter(usr => usr.id !== uuid);
                         await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                     }
@@ -1256,7 +1816,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_unlimit_cb:")) {
                     const uuid = data.replace("sub_unlimit_cb:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, trafficLimit: 0, dailyLimit: 0, expiryDays: 0 });
+                    } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.limitTotalReq = null;
@@ -1265,7 +1827,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
-                    const detail = getSubDetail(uuid);
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, detail.text, detail.kb, messageId);
                 } else if (data === "sub_add_unlimited_skip") {
                     let stateName = "Subscriber";
@@ -1280,23 +1843,30 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     } catch(e){}
                     
                     const newUuid = crypto.randomUUID();
-                    if (!sysConfig.users) sysConfig.users = [];
-                    sysConfig.users.push({
-                        id: newUuid,
-                        name: stateName,
-                        limitTotalReq: null,
-                        limitDailyReq: null,
-                        expiryMs: null,
-                        createdAt: Date.now()
-                    });
-                    
+                    if (isRemotePanel) {
+                        const res = await remotePanelWriteAction(activePanel, 'POST', null, { key: activePanel.masterKey, name: stateName });
+                        if (res.success && res.user) {
+                            const detail = getSubDetail(res.user.id, [res.user]);
+                            await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
+                        } else {
+                            await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                        }
+                    } else {
+                        if (!sysConfig.users) sysConfig.users = [];
+                        sysConfig.users.push({
+                            id: newUuid,
+                            name: stateName,
+                            limitTotalReq: null,
+                            limitDailyReq: null,
+                            expiryMs: null,
+                            createdAt: Date.now()
+                        });
+                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        const detail = getSubDetail(newUuid);
+                        await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
+                    }
                     tgState[chatId] = null;
                     await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    
-                    const successText = `✅ ${t("msg_added")}`;
-                    const detail = getSubDetail(newUuid);
-                    await sendOrEdit(chatId, `${successText}\n\n${detail.text}`, detail.kb, messageId);
                 } else if (data === "sys_panic_init") {
                     const text = `${t("msg_confirm_panic")}`;
                     const kb = {
@@ -1313,8 +1883,198 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     sysConfig.isPaused = true;
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
+                } else if (data === "sys_dashboard") {
+                    let users, activeCount, pausedCount, expiredCount, autoDisabledCount;
+                    if (isRemotePanel) {
+                        const statsRes = await fetchRemotePanelStats(activePanel);
+                        if (statsRes.success && statsRes.stats) {
+                            const s = statsRes.stats;
+                            users = [];
+                            activeCount = s.users?.active || 0;
+                            pausedCount = s.users?.paused || 0;
+                            expiredCount = s.users?.expired || 0;
+                            autoDisabledCount = s.users?.autoDisabled || 0;
+                        } else {
+                            const panelUsers = await getPanelUsers();
+                            users = panelUsers || [];
+                            activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+                            pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+                            expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
+                            autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+                        }
+                    } else {
+                        users = sysConfig.users || [];
+                        activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+                        pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+                        expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
+                        autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+                    }
+                    let dashText = `📊 **${t("dashboard")}**\n`;
+                    dashText += `━━━━━━━━━━━━━━━━\n`;
+                    dashText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
+                    dashText += `━━━━━━━━━━━━━━━━\n`;
+                    dashText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : (activeCount + pausedCount + expiredCount + autoDisabledCount)}\n`;
+                    dashText += `🟢 **${t("dash_active")}**: ${activeCount}\n`;
+                    dashText += `⏸️ **${t("dash_paused")}**: ${pausedCount}\n`;
+                    dashText += `🔴 **${t("dash_expired")}**: ${expiredCount}\n`;
+                    dashText += `🚫 **${t("dash_auto_disabled")}**: ${autoDisabledCount}\n`;
+                    if (!isRemotePanel) {
+                        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
+                        const dh = Math.floor(upSeconds / 3600);
+                        const dm = Math.floor((upSeconds % 3600) / 60);
+                        dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
+                        dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
+                        dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
+                    }
+                    dashText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, dashText, kb, messageId);
+                } else if (data === "sys_stats") {
+                    let users, totalReqs, dailyReqs;
+                    if (isRemotePanel) {
+                        const statsRes = await fetchRemotePanelStats(activePanel);
+                        if (statsRes.success && statsRes.stats) {
+                            const s = statsRes.stats;
+                            users = [];
+                            totalReqs = s.traffic?.totalRequests || 0;
+                            dailyReqs = s.traffic?.dailyRequests || 0;
+                        } else {
+                            const panelUsers = await getPanelUsers();
+                            users = panelUsers || [];
+                            totalReqs = 0;
+                            dailyReqs = 0;
+                        }
+                    } else {
+                        users = sysConfig.users || [];
+                        totalReqs = 0;
+                        dailyReqs = 0;
+                        const todayDate = new Date().toISOString().split('T')[0];
+                        users.forEach(u => {
+                            const idClean = u.id.replace(/-/g, '').toLowerCase();
+                            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+                            totalReqs += (sysU.reqs || 0);
+                            if (sysU.lastDay === todayDate) dailyReqs += (sysU.dReqs || 0);
+                        });
+                    }
+                    let statsText = `📈 **${t("stats_title")}**\n`;
+                    statsText += `━━━━━━━━━━━━━━━━\n`;
+                    statsText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
+                    statsText += `━━━━━━━━━━━━━━━━\n`;
+                    statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : 'N/A'}\n`;
+                    statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, statsText, kb, messageId);
+                } else if (data === "sys_panel_info") {
+                    let infoText = `ℹ️ **${t("panel_info")}**\n`;
+                    infoText += `━━━━━━━━━━━━━━━━\n`;
+                    infoText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
+                    if (activePanel.isLocal) {
+                        infoText += `🌐 **Host**: ${hostName}\n`;
+                        infoText += `🔑 **API Route**: \`${sysConfig.apiRoute}\`\n`;
+                        infoText += `📡 **Mode**: ${sysConfig.mode || 'alpha'}\n`;
+                        infoText += `🔒 **Ports**: ${sysConfig.socketPorts || '443'}\n`;
+                    } else {
+                        infoText += `🌐 **Host**: ${activePanel.host}\n`;
+                        infoText += `🔑 **API Route**: \`${activePanel.apiRoute}\`\n`;
+                    }
+                    infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
+                    infoText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, infoText, kb, messageId);
+                } else if (data.startsWith("subs_disabled:")) {
+                    const panelUsers = await getPanelUsers();
+                    const users = panelUsers || [];
+                    const disabledUsers = users.filter(u => u.isPaused);
+                    if (disabledUsers.length === 0) {
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                        await sendOrEdit(chatId, `🚫 ${t("msg_no_disabled")}`, kb, messageId);
+                    } else {
+                        const page = parseInt(data.replace("subs_disabled:", "")) || 0;
+                        const itemsPerPage = 5;
+                        const start = page * itemsPerPage;
+                        const end = start + itemsPerPage;
+                        const pageUsers = disabledUsers.slice(start, end);
+                        let text = `🚫 **${t("disabled_users")}** (${disabledUsers.length})\n━━━━━━━━━━━━━━━━\n`;
+                        const inline_keyboard = [];
+                        pageUsers.forEach((u) => {
+                            const reason = u.disabledReason || t("paused");
+                            text += `👤 **${u.name}**\n   ${reason}\n`;
+                            inline_keyboard.push([{ text: `▶️ ${u.name}`, callback_data: `sub_toggle:${u.id}` }]);
+                        });
+                        const navRow = [];
+                        if (page > 0) navRow.push({ text: `⬅️ ${t("btn_back")}`, callback_data: `subs_disabled:${page - 1}` });
+                        if (end < disabledUsers.length) navRow.push({ text: `${t("btn_next")} ➡️`, callback_data: `subs_disabled:${page + 1}` });
+                        if (navRow.length > 0) inline_keyboard.push(navRow);
+                        inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+                        await sendOrEdit(chatId, text, { inline_keyboard }, messageId);
+                    }
+                } else if (data === "sub_search_init") {
+                    tgState[chatId] = { step: "sub_search" };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `🔍 ${t("msg_enter_search")}`;
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_reset_traffic:")) {
+                    const uuid = data.replace("sub_reset_traffic:", "");
+                    if (isRemotePanel) {
+                        await remotePanelResetTraffic(activePanel, uuid);
+                    } else {
+                        if (!sysUsageCache) sysUsageCache = { users: {} };
+                        if (!sysUsageCache.users) sysUsageCache.users = {};
+                        const uuidClean = uuid.replace(/-/g, '').toLowerCase();
+                        if (sysUsageCache.users[uuidClean]) {
+                            sysUsageCache.users[uuidClean].reqs = 0;
+                            sysUsageCache.users[uuidClean].dReqs = 0;
+                        } else {
+                            sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                        }
+                        await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+                    }
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
+                    await sendOrEdit(chatId, `✅ ${t("msg_traffic_reset")}\n\n${detail.text}`, detail.kb, messageId);
+                } else if (data.startsWith("sub_extend_init:")) {
+                    const uuid = data.replace("sub_extend_init:", "");
+                    tgState[chatId] = { step: `sub_extend_days:${uuid}` };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `📅 ${t("msg_enter_extend_days")}`;
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_edit_notes_init:")) {
+                    const uuid = data.replace("sub_edit_notes_init:", "");
+                    tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `📝 ${t("msg_enter_notes")}`;
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_edit_device_init:")) {
+                    const uuid = data.replace("sub_edit_device_init:", "");
+                    tgState[chatId] = { step: `sub_edit_device:${uuid}` };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `📱 ${t("msg_enter_device_limit")}`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `♾️ Unlimited`, callback_data: `sub_device_unlimited:${uuid}` }],
+                        [{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]
+                    ] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_device_unlimited:")) {
+                    const uuid = data.replace("sub_device_unlimited:", "");
+                    if (isRemotePanel) {
+                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, maxConfigs: null });
+                    } else if (sysConfig.users) {
+                        const u = sysConfig.users.find(usr => usr.id === uuid);
+                        if (u) {
+                            u.maxConfigs = null;
+                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                    }
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
+                    await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
                 }
                 
                 await fetch(`${tgApi}/answerCallbackQuery`, {
@@ -1328,6 +2088,28 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const text = update.message.text.trim();
             
             if (chatId.toString() === sysConfig.tgChatId.toString()) {
+                // Get active panel from last login signal
+                const activePanel = getActivePanel();
+                const isRemotePanel = activePanel && !activePanel.isLocal;
+
+                // Helper to fetch users for the active panel
+                const getPanelUsers = async () => {
+                    if (isRemotePanel) {
+                        const res = await fetchRemotePanelUsers(activePanel);
+                        return res.success ? (res.users || []) : null;
+                    }
+                    return sysConfig.users || [];
+                };
+
+                // Handle /start command
+                if (text === "/start") {
+                    tgState[chatId] = null;
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const menu = getMainMenu(activePanel);
+                    await sendOrEdit(chatId, menu.text, menu.kb);
+                    return new Response("OK", { status: 200 });
+                }
+
                 const state = tgState[chatId];
                 
                 if (state) {
@@ -1361,29 +2143,45 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }
                         
                         const newUuid = crypto.randomUUID();
-                        if (!sysConfig.users) sysConfig.users = [];
-                        sysConfig.users.push({
-                            id: newUuid,
-                            name: name,
-                            limitTotalReq: tReq,
-                            limitDailyReq: dReq,
-                            expiryMs: days ? Date.now() + days * 86400000 : null,
-                            createdAt: Date.now()
-                        });
+                        if (isRemotePanel) {
+                            const res = await remotePanelWriteAction(activePanel, 'POST', null, {
+                                key: activePanel.masterKey,
+                                name: name,
+                                trafficLimit: tReq ? tReq / 6000 : 0,
+                                dailyLimit: dReq ? dReq / 6000 : 0,
+                                expiryDays: days || 0
+                            });
+                            if (res.success && res.user) {
+                                const detail = getSubDetail(res.user.id, [res.user]);
+                                await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
+                            } else {
+                                await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                            }
+                        } else {
+                            if (!sysConfig.users) sysConfig.users = [];
+                            sysConfig.users.push({
+                                id: newUuid,
+                                name: name,
+                                limitTotalReq: tReq,
+                                limitDailyReq: dReq,
+                                expiryMs: days ? Date.now() + days * 86400000 : null,
+                                createdAt: Date.now()
+                            });
+                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            const detail = getSubDetail(newUuid);
+                            await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
+                        }
                         
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        
-                        const successText = `✅ ${t("msg_added")}`;
-                        const detail = getSubDetail(newUuid);
-                        await sendOrEdit(chatId, `${successText}\n\n${detail.text}`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
                     
                     if (state.step.startsWith("sub_edit_name:")) {
                         const uuid = state.step.replace("sub_edit_name:", "");
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, name: text });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.name = text;
@@ -1393,7 +2191,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
                         
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Successfully Changed!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
@@ -1409,7 +2208,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         if (parts[1] > 0) dReq = parts[1];
                         if (parts[2] > 0) days = parts[2];
                         
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, {
+                                key: activePanel.masterKey,
+                                trafficLimit: tReq ? tReq / 6000 : 0,
+                                dailyLimit: dReq ? dReq / 6000 : 0,
+                                expiryDays: days || 0
+                            });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.limitTotalReq = tReq;
@@ -1421,14 +2227,116 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
                         
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Limits Updated!`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step === "sub_search") {
+                        const query = text.toLowerCase();
+                        const panelUsers = await getPanelUsers();
+                        const users = panelUsers || [];
+                        const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        if (results.length === 0) {
+                            const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                            await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
+                        } else {
+                            let searchText = `🔍 **Search Results** (${results.length})\n━━━━━━━━━━━━━━━━\n`;
+                            const inline_keyboard = [];
+                            results.slice(0, 10).forEach(u => {
+                                const statusEmoji = u.isPaused ? "⏸️" : (u.expiryMs && Date.now() > u.expiryMs ? "🔴" : "🟢");
+                                searchText += `${statusEmoji} **${u.name}**\n`;
+                                inline_keyboard.push([{ text: `👤 ${u.name}`, callback_data: `sub_detail:${u.id}` }]);
+                            });
+                            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+                            await sendOrEdit(chatId, searchText, { inline_keyboard });
+                        }
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step.startsWith("sub_extend_days:")) {
+                        const uuid = state.step.replace("sub_extend_days:", "");
+                        const days = parseInt(text);
+                        if (isNaN(days) || days <= 0) {
+                            await sendOrEdit(chatId, t("msg_invalid"));
+                            return new Response("OK", { status: 200 });
+                        }
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, expiryDays: days });
+                        } else if (sysConfig.users) {
+                            const u = sysConfig.users.find(usr => usr.id === uuid);
+                            if (u) {
+                                if (u.expiryMs) {
+                                    u.expiryMs += days * 86400000;
+                                } else {
+                                    u.expiryMs = Date.now() + days * 86400000;
+                                }
+                                if (u.isPaused && u.disabledReason && u.disabledReason.includes('Expiration')) {
+                                    u.isPaused = false;
+                                    u.disabledReason = null;
+                                    u.disabledAt = null;
+                                }
+                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            }
+                        }
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
+                        const msg = t("msg_expiry_extended").replace("{days}", days);
+                        await sendOrEdit(chatId, `✅ ${msg}\n\n${detail.text}`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step.startsWith("sub_edit_notes:")) {
+                        const uuid = state.step.replace("sub_edit_notes:", "");
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, notes: text });
+                        } else if (sysConfig.users) {
+                            const u = sysConfig.users.find(usr => usr.id === uuid);
+                            if (u) {
+                                u.notes = text;
+                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            }
+                        }
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
+                        await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step.startsWith("sub_edit_device:")) {
+                        const uuid = state.step.replace("sub_edit_device:", "");
+                        const limit = parseInt(text);
+                        if (isNaN(limit) || limit < 0) {
+                            await sendOrEdit(chatId, t("msg_invalid"));
+                            return new Response("OK", { status: 200 });
+                        }
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, maxConfigs: limit > 0 ? limit : null });
+                        } else if (sysConfig.users) {
+                            const u = sysConfig.users.find(usr => usr.id === uuid);
+                            if (u) {
+                                u.maxConfigs = limit > 0 ? limit : null;
+                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            }
+                        }
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
+                        await sendOrEdit(chatId, `✅ Device limit updated!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
                 }
                 
                 // Default message / fallback menu
-                const menu = getMainMenu();
+                const menu = getMainMenu(activePanel);
                 await sendOrEdit(chatId, menu.text, menu.kb);
             }
         }
@@ -3241,6 +4149,11 @@ function getDashboardUI(hasDB) {
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_chat">Chat ID</label>
                                   <input type="text" id="cfg-tg-chat" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                               </div>
+                              <div class="space-y-1 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_admin">Authorized Telegram Admin ID</label>
+                                  <input type="text" id="cfg-tg-admin" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                  <p class="text-xs text-slate-400 mt-1" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
+                              </div>
                               <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
                           </div>
                           
@@ -3261,10 +4174,10 @@ function getDashboardUI(hasDB) {
                           </div>
                       </div>
                       
-                      <!-- USERS VIEW -->
+                          <!-- USERS VIEW -->
                       <div id="view-users" class="hidden space-y-6">
                           <!-- Stats Grid -->
-                          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                          <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
                               <div class="bg-white dark:bg-darkcard rounded-3xl p-5 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden flex items-center justify-between">
                                   <div>
                                       <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block" data-i18n="stat_total_subscribers">Total Subscribers</span>
@@ -3292,6 +4205,35 @@ function getDashboardUI(hasDB) {
                                       <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                                   </div>
                               </div>
+                              <div class="bg-white dark:bg-darkcard rounded-3xl p-5 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden flex items-center justify-between">
+                                  <div>
+                                      <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block" data-i18n="stat_auto_disabled">Auto-Disabled</span>
+                                      <span id="stat-auto-disabled" class="text-2xl font-black text-slate-800 dark:text-white mt-1 block">0</span>
+                                  </div>
+                                  <div class="p-3 bg-red-500/10 text-red-500 rounded-xl">
+                                      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                                  </div>
+                              </div>
+                          </div>
+
+                          <!-- Recently Disabled Users Panel -->
+                          <div id="disabled-users-panel" class="hidden">
+                              <div class="bg-gradient-to-br from-red-50 to-orange-50 dark:from-red-950/30 dark:to-orange-950/30 rounded-3xl p-6 shadow-sm border border-red-200 dark:border-red-800/40 relative overflow-hidden">
+                                  <div class="flex items-center justify-between mb-4">
+                                      <div class="flex items-center gap-3">
+                                          <div class="p-2.5 bg-red-100 dark:bg-red-900/40 rounded-xl">
+                                              <svg class="w-5 h-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                                          </div>
+                                          <div>
+                                              <h3 class="text-sm font-bold text-red-700 dark:text-red-300" data-i18n="disabled_panel_title">Recently Disabled Users</h3>
+                                              <p class="text-[11px] text-red-500/70 dark:text-red-400/60" data-i18n="disabled_panel_desc">Users automatically disabled due to quota or expiration limits</p>
+                                          </div>
+                                      </div>
+                                      <span id="disabled-panel-badge" class="px-3 py-1 bg-red-500 text-white text-xs font-bold rounded-full shadow-sm">0</span>
+                                  </div>
+                                  <div id="disabled-users-list" class="space-y-2.5 max-h-64 overflow-y-auto pr-1">
+                                  </div>
+                              </div>
                           </div>
 
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
@@ -3301,6 +4243,12 @@ function getDashboardUI(hasDB) {
                                        <p class="text-xs text-slate-400 mt-1" data-i18n="sub_directory_desc">Search, modify bounds, toggle traffic limits or clear billing sessions.</p>
                                   </div>
                                   <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                                      <select id="user-status-filter" onchange="renderUsersTable()" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
+                                          <option value="all" data-i18n="filter_all">All Users</option>
+                                          <option value="active" data-i18n="filter_active">Active</option>
+                                          <option value="paused" data-i18n="filter_paused">Paused</option>
+                                          <option value="auto-disabled" data-i18n="filter_auto_disabled">Auto-Disabled</option>
+                                      </select>
                                       <input type="text" id="user-search-input" onkeyup="renderUsersTable()" placeholder="🔍 Find by Name or UUID..." data-i18n="user_search_placeholder" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
                                       <button onclick="document.getElementById('modal-add-user').classList.remove('hidden'); buildPortCheckboxes('add-user-ports-wrap', null); buildModeCheckboxes('add-user-mode-wrap', null);" class="px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm" data-i18n="btn_add_user">+ Add New User</button>
                                   </div>
@@ -3508,7 +4456,7 @@ function getDashboardUI(hasDB) {
                       </div>
                       <div>
                           <h3 class="text-lg font-black text-slate-800 dark:text-white" data-i18n="v_pop_title">Version Update</h3>
-                          <span class="text-[10px] font-bold px-2 py-0.5 bg-indigo-500 text-white rounded-full tracking-wide">v2.4.9</span>
+                          <span id="modal-version-badge" class="text-[10px] font-bold px-2 py-0.5 bg-indigo-500 text-white rounded-full tracking-wide"></span>
                       </div>
                   </div>
                   <button onclick="closeVersionModal()" class="text-slate-400 hover:text-slate-700 dark:hover:text-white bg-slate-50 dark:bg-slate-800 p-2 rounded-xl border border-slate-100 dark:border-darkborder transition-colors">
@@ -3521,17 +4469,10 @@ function getDashboardUI(hasDB) {
               <div class="space-y-4">
                   <div class="p-4 bg-slate-50 dark:bg-slate-800/30 rounded-2xl border border-slate-100 dark:border-darkborder/50">
                       <p class="text-xs font-bold text-slate-400 uppercase tracking-widest" data-i18n="v_pop_whatsnew">What's New in This Version</p>
-                      <h4 class="text-sm font-black text-slate-700 dark:text-white mt-1" data-i18n="v_pop_headline">Bug Fixes & Improvements</h4>
+                      <h4 id="modal-version-headline" class="text-sm font-black text-slate-700 dark:text-white mt-1"></h4>
                   </div>
                   
-                  <div class="space-y-4 max-h-[40vh] overflow-y-auto pe-2 text-start">
-                      <div class="flex gap-3">
-                          <div class="text-primary mt-1">✨</div>
-                          <div>
-                              <strong class="text-xs font-black text-slate-700 dark:text-slate-300" data-i18n="v_pop_b1_title">Add Custom Protocol-Port And Max Config For Users </strong>
-                          </div>
-                      
-                    </div>
+                  <div id="modal-changelog-container" class="space-y-4 max-h-[50vh] overflow-y-auto pe-2 text-start">
                   </div>
               </div>
 
@@ -3542,7 +4483,7 @@ function getDashboardUI(hasDB) {
       </div>
   
       <script>
-          const CURRENT_VERSION = "2.4.9";
+          const CURRENT_VERSION = "${CURRENT_VERSION}";
           const i18n = {
               en: {
                   title: "Nahan Gateway", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
@@ -3552,7 +4493,7 @@ function getDashboardUI(hasDB) {
                   lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
-                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)", lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
+                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
                   lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
                   lbl_sub_ua: "Custom Subscription User-Agent", desc_sub_ua: "Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.",
@@ -3563,8 +4504,10 @@ function getDashboardUI(hasDB) {
                   limit_total: "Traffic (GB) Limit (Leave empty for unlimited)", limit_daily: "Daily Requests Limit (Leave empty for unlimited)",
                   limit_days: "Expiration limit (Days) - Leave empty for unlimited", edit_sub: "Edit Subscriber", lbl_name_ph: "Name or UUID",
                   btn_save_changes: "Save Changes", save_btn_user: "Save User", status_active: "Active", status_paused: "Paused", status_expired: "Expired",
-                  stat_total_subscribers: "Total Subscribers", stat_active_paused: "Active / Paused", stat_cumulative_traffic: "Cumulative Traffic",
+                  stat_total_subscribers: "Total Subscribers", stat_active_paused: "Active / Paused", stat_cumulative_traffic: "Cumulative Traffic", stat_auto_disabled: "Auto-Disabled",
                   sub_directory_title: "Subscriber Directory", sub_directory_desc: "Search, modify bounds, toggle traffic limits or clear billing sessions.", user_search_placeholder: "🔍 Find by Name or UUID...",
+                  filter_all: "All Users", filter_active: "Active", filter_paused: "Paused", filter_auto_disabled: "Auto-Disabled",
+                  disabled_panel_title: "Recently Disabled Users", disabled_panel_desc: "Users automatically disabled due to quota or expiration limits",
                   lbl_u_Protocol:"Protocol Mode (Leave empty to use global setting)",
                   lbl_u_ports:"Custom Ports (Optional - overrides global ports, comma separated e.g. 443,80",
                   lbl_u_max_config:"Max Configs",
@@ -3572,17 +4515,9 @@ function getDashboardUI(hasDB) {
                   lbl_u_ipproxy:"User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)",
                   lbl_custom_panel_url:"Custom Panel URL / Subscription Domain",
                   v_pop_title: "Release Notice", v_pop_whatsnew: "What's New", v_pop_headline: "New Features & Improvements",
-                  v_pop_b1_title: "Add Custom Protocol-Port And Max Config For Users",
-                  desc_custom_panel_url:"Optionally specify a custom domain/URL to be used for subscription/sync links. If empty, the default Worker address will be used.",
-                  stat_datetime:"Date Time",
-                  v_pop_b2_title: "",
-                  v_pop_b3_title: "",
-                  v_pop_b4_title: "",
-                  v_pop_b5_title: "",
-                  v_pop_b6_title: "",
-                  v_pop_b7_title: "",
                   v_pop_btn: "Got it!",
-                  changelog_title: "Release Notes & Changelog:"
+                  changelog_title: "Release Notes & Changelog:",
+                  changelog_added: "Added", changelog_fixed: "Fixed", changelog_improved: "Improved", changelog_changed: "Changed", changelog_note: "Important Notes",
               },
               fa: {
                   title: "دروازه نهان", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای پایگاه داده یافت نشد! تنظیمات ذخیره نمی‌شوند.",
@@ -3592,7 +4527,7 @@ function getDashboardUI(hasDB) {
                   lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
                   lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
-                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
+                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
                   lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
@@ -3611,30 +4546,136 @@ function getDashboardUI(hasDB) {
                   limit_days: "مدت زمان اعتبار قانونی (روز) - برای نامحدود خالی بگذارید", edit_sub: "ویرایش مشترک", lbl_name_ph: "نام یا شناسه یکتا",
                   btn_save_changes: "ذخیره تغییرات", save_btn_user: "ثبت کاربر جدید", status_active: "فعال", status_paused: "متوقف شده", status_expired: "منقضی شده",
                   export_btn: "📥 برون‌بری فایل پیکربندی (نسخه پشتیبان)", import_btn: "📤 درون‌ریزی فایل پیکربندی (نسخه پشتیبان)",
-                  stat_total_subscribers: "کل مشترکین", stat_active_paused: "فعال / متوقف شده", stat_cumulative_traffic: "ترافیک کل انباشته",
+                  stat_total_subscribers: "کل مشترکین", stat_active_paused: "فعال / متوقف شده", stat_cumulative_traffic: "ترافیک کل انباشته", stat_auto_disabled: "غیرفعال خودکار",
                   sub_directory_title: "فهرست مشترکین", sub_directory_desc: "جستجو، اصلاح محدودیت‌ها، تغییر محدودیت‌های ترافیک یا پاک کردن جلسات حسابداری.", user_search_placeholder: "🔍 جستجو بر اساس نام یا شناسه...",
+                  filter_all: "همه کاربران", filter_active: "فعال", filter_paused: "متوقف شده", filter_auto_disabled: "غیرفعال خودکار",
+                  disabled_panel_title: "کاربران اخیراً غیرفعال شده", disabled_panel_desc: "کاربرانی که به دلیل اتمام سهمیه یا تاریخ انقضا غیرفعال شده‌اند",
                   lbl_u_Protocol:"نوع پروتکل(خالی بر اساس تنظیمات کلی)",
                   lbl_u_ports:"نوع پورت",
                   lbl_u_max_config:"حداکثر تعداد کانفیگ",
                   login_password:"رمز ورود",
                   lbl_u_ipproxy:"آی‌پی(های) پروکسی کاربر (اختیاری - آی‌پی پاک سراسری را نادیده می‌گیرد، با کاما/خط جدید از هم جدا می‌شوند)",
                   v_pop_title: "اطلاعیه تعمیرات", v_pop_whatsnew: "ویژگی‌های جدید", v_pop_headline: "امکانات جدید و بهبودها",
-                  v_pop_b1_title: "اضافه شدن تنظیمات جدا برای هرکاربر(تعداد گانفیگ،پروتکل وپورت)",
-                  lbl_custom_panel_url:"آدرس اینترنتی پنل سفارشی / دامنه اشتراک",
-                   desc_custom_panel_url:"در صورت تمایل، یک دامنه/آدرس اینترنتی سفارشی برای استفاده از لینک‌های اشتراک/همگام‌سازی مشخص کنید. در صورت خالی بودن، از آدرس پیش‌فرض Worker استفاده خواهد شد.",
-                   stat_datetime:"زمان",
-                  v_pop_b2_title: "",
-                  v_pop_b3_title: "",
-                  v_pop_b4_title: "",
-                  v_pop_b5_title: "",
-                  v_pop_b6_title: "",
-                  v_pop_b7_title: "",
                   v_pop_btn: "متوجه شدم!",
-                 
-                  changelog_title: "گزارش تغییرات و توضیحات نسخه جدید:"
+                  changelog_title: "گزارش تغییرات و توضیحات نسخه جدید:",
+                   changelog_added: "اضافه شده", changelog_fixed: "رفع شده", changelog_improved: "بهبود یافته", changelog_changed: "تغییر یافته", changelog_note: "نکات مهم",
+              }
+          };
+
+          const CHANGELOG_DATA = {
+              "2.5.1": {
+                  headline: { en: "Simplified Panel Management & Bot Stability", fa: "مدیریت ساده‌شده پنل و پایداری ربات" },
+                  added: [
+                      { en: "Web login signal system — bot auto-detects the last active web-logged panel", fa: "سیستم سیگنال ورود وب — ربات به‌طور خودکار آخرین پنل واردشده از وب را شناسایی می‌کند" },
+                      { en: "Login sync endpoint (/tg/sync_panel) for remote panels to notify the hub on admin login", fa: "نقطه پایانی همگام‌سازی ورود (/tg/sync_panel) برای اطلاع‌رسانی پنل‌های راهدور به هاب هنگام ورود مدیر" },
+                      { en: "Hub panel URL config (hubPanelUrl) for remote panels to signal login events", fa: "پیکربندی آدرس هاب پنل (hubPanelUrl) برای ارسال سیگنال ورود از پنل‌های راهدور" },
+                      { en: "Full user management via Telegram bot (create, edit, delete, search, disable, re-enable)", fa: "مدیریت کامل کاربران از طریق ربات تلگرام (ایجاد، ویرایش، حذف، جستجو، غیرفعال‌سازی، فعال‌سازی مجدد)" },
+                      { en: "HTTP REST API for all user operations at /api/users (GET, POST, PUT, DELETE)", fa: "API جدید REST برای تمام عملیات کاربران در /api/users" },
+                      { en: "Statistics API at /api/stats with user counts, traffic totals, and system status", fa: "API آمار در /api/stats با تعداد کاربران، مجموع ترافیک و وضعیت سیستم" },
+                  ],
+                  fixed: [
+                      { en: "Removed multi-panel selection system that caused session confusion and incorrect panel switching", fa: "حذف سیستم انتخاب چندپنلی که باعث سردرگمی نشست و جابجایی نادرست پنل می‌شد" },
+                      { en: "Fixed bot not responding after pressing /start due to stale step state", fa: "رفع مشکل پاسخ ندادن ربات پس از فشار دادن /start به دلیل وضعیت مرحله قدیمی" },
+                      { en: "Fixed panel context mixing when switching between panels", fa: "رفع مشکل ترکیب زمینه پنل هنگام جابجایی بین پنل‌ها" },
+                      { en: "Fixed race condition in bot state persistence from non-blocking D1 writes", fa: "رفع مشکل شرایط مسابقه در ماندگاری وضعیت ربات ناشی از نوشتن غیرهمزمان D1" },
+                  ],
+                  improved: [
+                      { en: "/start now directly opens panel management based on last web login — no panel selection menu", fa: "/start اکنون مستقیماً مدیریت پنل را بر اساس آخرین ورود وب باز می‌کند — بدون منوی انتخاب پنل" },
+                      { en: "Bot automatically links Telegram session to the last active web-logged panel", fa: "ربات به‌طور خودکار نشست تلگرام را به آخرین پنل فعال واردشده از وب متصل می‌کند" },
+                      { en: "Simplified bot logic with clean 1-to-1 mapping between web login and Telegram session", fa: "ساده‌سازی منطق ربات با نگاشت یک‌به‌یک بین ورود وب و نشست تلگرام" },
+                      { en: "Telegram bot main menu redesigned with inline keyboard layout for mobile-first management", fa: "منوی اصلی ربات تلگرام با طرح‌بندی کیبورد درون‌خطی برای مدیریت موبایل‌محور بازطراحی شد" },
+                  ],
+                  notes: [
+                      { en: "Single-panel mode works more reliably — it is recommended to use one Telegram bot per panel for best stability", fa: "حالت تک‌پنلی پایدارتر است — توصیه می‌شود برای بهترین پایداری از یک ربات تلگرام برای هر پنل استفاده کنید" },
+                      { en: "For multi-panel setups: set hubPanelUrl on each remote panel to enable automatic login sync", fa: "برای تنظیمات چندپنلی: hubPanelUrl را روی هر پنل راهدور تنظیم کنید تا همگام‌سازی خودکار ورود فعال شود" },
+                      { en: "Each panel having its own dedicated bot improves session accuracy and prevents panel mix-up issues", fa: "داشتن ربات اختصاصی برای هر پنل، دقت نشست را بهبود می‌دهد و از مشکلات ترکیب پنل جلوگیری می‌کند" },
+                      { en: "API endpoints are authenticated via Master Key (Bearer token or ?key= parameter)", fa: "نقاط پایانی API از طریق کلید اصلی احراز هویت می‌شوند (توکن Bearer یا پارامتر ?key=)" },
+                  ]
+              },
+              "2.5.0": {
+                  headline: { en: "User Auto-Disable & Management Improvements", fa: "غیرفعال‌سازی خودکار کاربر و بهبود مدیریت" },
+                  added: [
+                      { en: "Automatic user disable on traffic limit exceeded", fa: "غیرفعال‌سازی خودکار کاربر هنگام اتمام محدودیت ترافیک" },
+                      { en: "Automatic user disable on expiration date reached", fa: "غیرفعال‌سازی خودکار کاربر هنگام رسیدن به تاریخ انقضا" },
+                      { en: "Activity log and Telegram notification for auto-disabled users", fa: "ثبت در گزارش فعالیت و ارسال اعلان تلگرام برای کاربران غیرفعال شده خودکار" },
+                      { en: "Recently Disabled Users notification panel in Users tab", fa: "پنل اعلان کاربران اخیراً غیرفعال شده در بخش کاربران" },
+                      { en: "Status filter dropdown (All/Active/Paused/Auto-Disabled)", fa: "فیلتر وضعیت (همه/فعال/متوقف/غیرفعال خودکار)" },
+                      { en: "Auto-Disabled statistics card in dashboard", fa: "کارت آمار غیرفعال‌سازی خودکار در داشبورد" },
+                  ],
+                  fixed: [
+                      { en: "Expired users are now disabled instead of deleted", fa: "کاربران منقضی شده اکنون غیرفعال می‌شوند به جای حذف" },
+                      { en: "Users exceeding traffic limits are preserved in panel", fa: "کاربرانی که محدودیت ترافیک را رد می‌کنند در پنل حفظ می‌شوند" },
+                  ],
+                  improved: [
+                      { en: "User data, statistics, and history are now preserved", fa: "داده‌ها، آمار و تاریخچه کاربران اکنون حفظ می‌شود" },
+                      { en: "Account renewal workflow for administrators", fa: "فرآیند تمدید حساب برای مدیران" },
+                  ],
+                  notes: [
+                      { en: "Re-enabling a user clears the auto-disable reason", fa: "فعال‌سازی مجدد کاربر، دلیل غیرفعال‌سازی خودکار را پاک می‌کند" },
+                  ]
+              },
+              "2.4.9": {
+                  headline: { en: "Custom Protocol & Port Configuration", fa: "پیکربندی پروتکل و پورت سفارشی" },
+                  added: [
+                      { en: "Custom protocol mode per user (VLESS/Trojan/Both)", fa: "حالت پروتکل سفارشی برای هر کاربر (VLESS/Trojan/هر دو)" },
+                      { en: "Custom port configuration per user", fa: "پیکربندی پورت سفارشی برای هر کاربر" },
+                      { en: "Maximum configs limit per user", fa: "محدودیت حداکثر کانفیگ برای هر کاربر" },
+                  ],
+                  fixed: [],
+                  improved: [
+                      { en: "User management panel interface", fa: "رابط کاربری پنل مدیریت کاربران" },
+                  ],
+                  notes: []
               }
           };
   
+          function renderChangelog(version) {
+              const container = document.getElementById('modal-changelog-container');
+              if (!container) return;
+              
+              const data = CHANGELOG_DATA[version];
+              if (!data) {
+                  container.innerHTML = '<p class="text-slate-400 text-xs">No changelog available for this version.</p>';
+                  return;
+              }
+
+              const t = (key) => i18n[lang]?.[key] || i18n['en']?.[key] || key;
+              let html = '';
+
+              if (data.headline) {
+                  const headlineEl = document.getElementById('modal-version-headline');
+                  if (headlineEl) headlineEl.textContent = data.headline[lang] || data.headline['en'];
+              }
+
+              const sections = [
+                  { key: 'added', icon: '✨', color: 'emerald', items: data.added },
+                  { key: 'fixed', icon: '🔧', color: 'blue', items: data.fixed },
+                  { key: 'improved', icon: '⚡', color: 'violet', items: data.improved },
+                  { key: 'changed', icon: '🔄', color: 'amber', items: data.changed },
+                  { key: 'note', icon: '⚠️', color: 'red', items: data.notes },
+              ];
+
+              sections.forEach(section => {
+                  if (section.items && section.items.length > 0) {
+                      html += '<div class="mb-4">';
+                      html += '<div class="flex items-center gap-2 mb-2">';
+                      html += '<span class="text-sm">' + section.icon + '</span>';
+                      html += '<h5 class="text-xs font-bold text-' + section.color + '-600 dark:text-' + section.color + '-400 uppercase tracking-wider">' + t('changelog_' + section.key) + '</h5>';
+                      html += '</div>';
+                      html += '<div class="space-y-1.5 ps-6">';
+                      section.items.forEach(item => {
+                          html += '<div class="flex items-start gap-2">';
+                          html += '<span class="text-' + section.color + '-400 mt-1.5">•</span>';
+                          html += '<span class="text-xs text-slate-600 dark:text-slate-300">' + (item[lang] || item['en']) + '</span>';
+                          html += '</div>';
+                      });
+                      html += '</div></div>';
+                  }
+              });
+
+              container.innerHTML = html || '<p class="text-slate-400 text-xs">No changes documented.</p>';
+          }
+
           let lang = localStorage.getItem('lang') || 'fa';
           let sessionKey = "", baseRoute = window.location.pathname.split('/dash')[0];
           let hostName = window.location.hostname, localUUID = "";
@@ -3687,6 +4728,9 @@ function getDashboardUI(hasDB) {
               const popupKey = \`nahan_shown_v\${CURRENT_VERSION}\`;
               if (!localStorage.getItem(popupKey)) {
                   setTimeout(() => {
+                      const badge = document.getElementById('modal-version-badge');
+                      if (badge) badge.textContent = 'v' + CURRENT_VERSION;
+                      renderChangelog(CURRENT_VERSION);
                       const m = document.getElementById('modal-version-update');
                       if (m) {
                           m.classList.remove('hidden');
@@ -3819,7 +4863,7 @@ function getDashboardUI(hasDB) {
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                  tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                  tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                   isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                   githubRepo: el('cfg-github-repo').value,
@@ -3858,6 +4902,7 @@ function getDashboardUI(hasDB) {
                       mapId('cfg-relay', conf.backupRelay);
                       mapId('cfg-tg-token', conf.tgToken);
                       mapId('cfg-tg-chat', conf.tgChatId);
+                      mapId('cfg-tg-admin', conf.tgAdminId);
                       mapId('cfg-cf-acc', conf.cfAccountId);
                       mapId('cfg-cf-token', conf.cfApiToken);
                       mapId('cfg-github-repo', conf.githubRepo);
@@ -3969,6 +5014,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
                       document.getElementById('cfg-tg-token').value = conf.tgToken || '';
                       document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
+                      document.getElementById('cfg-tg-admin').value = conf.tgAdminId || '';
                       document.getElementById('cfg-cf-acc').value = conf.cfAccountId || '';
                       document.getElementById('cfg-cf-token').value = conf.cfApiToken || '';
                       document.getElementById('cfg-pause').checked = conf.isPaused || false;
@@ -4091,7 +5137,7 @@ function getDashboardUI(hasDB) {
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                       resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
@@ -4133,7 +5179,7 @@ function getDashboardUI(hasDB) {
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                       resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
@@ -4170,7 +5216,9 @@ function getDashboardUI(hasDB) {
               // Calculate stats metrics
               let totalUsersVal = users.length;
               let activeSubscribers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-              let pausedSubscribers = users.filter(u => u.isPaused).length;
+              let autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+              let pausedSubscribers = users.filter(u => u.isPaused && !u.disabledReason).length;
+              let expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
               let totalReqsSum = 0;
               users.forEach(u => {
                   let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0};
@@ -4185,10 +5233,49 @@ function getDashboardUI(hasDB) {
               if (activeUsersEl) activeUsersEl.textContent = \`\${activeSubscribers} / \${pausedSubscribers}\`;
               const totalTrafficEl = document.getElementById('stat-total-traffic');
               if (totalTrafficEl) totalTrafficEl.textContent = \`\${totalGBSum} GB\`;
+              const autoDisabledEl = document.getElementById('stat-auto-disabled');
+              if (autoDisabledEl) autoDisabledEl.textContent = autoDisabledCount;
 
-              // Apply Search Filter
+              // Render Recently Disabled Users Panel
+              const disabledPanel = document.getElementById('disabled-users-panel');
+              const disabledList = document.getElementById('disabled-users-list');
+              const disabledBadge = document.getElementById('disabled-panel-badge');
+              if (disabledPanel && disabledList) {
+                  const autoDisabledUsers = users.filter(u => u.isPaused && u.disabledReason)
+                      .sort((a, b) => (b.disabledAt || 0) - (a.disabledAt || 0));
+                  if (autoDisabledUsers.length > 0) {
+                      disabledPanel.classList.remove('hidden');
+                      if (disabledBadge) disabledBadge.textContent = autoDisabledUsers.length;
+                      disabledList.innerHTML = autoDisabledUsers.map(u => {
+                          let timeStr = u.disabledAt ? new Date(u.disabledAt).toLocaleString() : '-';
+                          let reasonIcon = u.disabledReason.includes('Traffic') ? '📊' : (u.disabledReason.includes('Expiration') ? '📅' : '⚠️');
+                          let btnLabel = lang === 'fa' ? 'فعال‌سازی مجدد' : 'Re-enable';
+                          return \`
+                              <div class="flex items-center justify-between p-3 bg-white/70 dark:bg-slate-800/50 rounded-xl border border-red-100 dark:border-red-800/20 hover:shadow-md transition-shadow">
+                                  <div class="flex items-center gap-3 flex-1 min-w-0">
+                                      <div class="text-lg">\${reasonIcon}</div>
+                                      <div class="min-w-0">
+                                          <div class="text-sm font-bold text-slate-700 dark:text-slate-200 truncate">\${u.name}</div>
+                                          <div class="text-[11px] text-red-500 dark:text-red-400 font-medium">\${u.disabledReason}</div>
+                                          <div class="text-[10px] text-slate-400 mt-0.5">\${timeStr}</div>
+                                      </div>
+                                  </div>
+                                  <button onclick="togglePauseUser('\${u.id}')" class="ml-3 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white text-[11px] font-bold rounded-lg shadow-sm transition-colors whitespace-nowrap">\${btnLabel}</button>
+                              </div>
+                          \`;
+                      }).join('');
+                  } else {
+                      disabledPanel.classList.add('hidden');
+                  }
+              }
+
+              // Apply Status Filter
+              const statusFilter = document.getElementById('user-status-filter')?.value || 'all';
               const searchVal = document.getElementById('user-search-input')?.value.toLowerCase().trim() || '';
               let filteredUsers = users.filter(u => {
+                  if (statusFilter === 'active' && (u.isPaused || (u.expiryMs && Date.now() > u.expiryMs))) return false;
+                  if (statusFilter === 'paused' && (!u.isPaused || u.disabledReason)) return false;
+                  if (statusFilter === 'auto-disabled' && !(u.isPaused && u.disabledReason)) return false;
                   return u.name.toLowerCase().includes(searchVal) || u.id.toLowerCase().includes(searchVal);
               });
 
@@ -4246,6 +5333,25 @@ function getDashboardUI(hasDB) {
 
                   let resetBtnHtml = \`<button onclick="resetUserTraffic('\${u.id}')" class="text-violet-500 hover:text-violet-700 bg-violet-50 hover:bg-violet-100 dark:bg-violet-900/30 dark:hover:bg-violet-800/50 p-2 rounded-lg" title="\${resetTitle}">🔄</button>\`;
 
+                  let isAutoDisabled = u.isPaused && u.disabledReason;
+                  let disableInfoHtml = '';
+                  if (isAutoDisabled) {
+                      let reasonLabel = u.disabledReason;
+                      let timeLabel = u.disabledAt ? new Date(u.disabledAt).toLocaleString() : '';
+                      let reasonTitle = lang === 'fa' ? 'علت غیرفعال‌سازی' : 'Disable Reason';
+                      let timeTitle = lang === 'fa' ? 'زمان غیرفعال‌سازی' : 'Disabled At';
+                      disableInfoHtml = \`
+                          <div class="mt-2 p-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/30">
+                              <div class="flex items-center gap-1.5 text-[10px] font-bold text-red-600 dark:text-red-400">
+                                  <span>⚠️</span>
+                                  <span>\${reasonTitle}:</span>
+                              </div>
+                              <div class="text-[10px] text-red-500 dark:text-red-300 mt-0.5">\${reasonLabel}</div>
+                              \${timeLabel ? \`<div class="text-[9px] text-slate-400 mt-1">\${timeTitle}: \${timeLabel}</div>\` : ''}
+                          </div>
+                      \`;
+                  }
+
                   let tr = document.createElement('tr');
                   tr.className = "hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors";
                   
@@ -4255,12 +5361,14 @@ function getDashboardUI(hasDB) {
                   }
 
                   tr.innerHTML = \`
-                      <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${u.isPaused ? '⏸️' : (isExp ? '🔴' : '🟢')}
+                      <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${u.isPaused ? (isAutoDisabled ? '🚫' : '⏸️') : (isExp ? '🔴' : '🟢')}
                           <div class="flex flex-wrap gap-1 mt-1">
+                              \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
                               \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'VLESS+Trojan'}</span>\` : ''}
                               \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-300">🔌 \${u.userPorts}</span>\` : ''}
                               \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-600 dark:text-amber-300">max \${u.maxConfigs} cfgs</span>\` : ''}
                           </div>
+                          \${disableInfoHtml}
                       </td>
                       <td class="px-4 py-4 font-mono text-xs text-slate-500 select-all">\${u.id}</td>
                       <td class="px-4 py-4 text-slate-600 dark:text-slate-400 font-mono">
@@ -4336,6 +5444,10 @@ function getDashboardUI(hasDB) {
                   let usr = window.nahanConfig.users.find(u => u.id === uuid);
                   if (usr) {
                       usr.isPaused = !usr.isPaused;
+                      if (!usr.isPaused) {
+                          usr.disabledReason = null;
+                          usr.disabledAt = null;
+                      }
                       renderUsersTable();
                       doSaveDirectly();
                   }
