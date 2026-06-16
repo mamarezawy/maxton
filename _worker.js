@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.4";
+const CURRENT_VERSION = "2.5.4.1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -4769,6 +4769,21 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "2.5.4.1": {
+                  headline: { en: "Security Hotfix — Bot Authorization", fa: "اصلاح امنیتی — احراز هویت ربات" },
+                  added: [],
+                  fixed: [
+                      { en: "Fixed critical issue where unauthorized users could access bot and panel data via Worker", fa: "رفع مشکل بحرانی دسترسی کاربران غیرمجاز به اطلاعات ربات و پنل از طریق Worker" },
+                      { en: "Added proper Telegram user ID validation for all Worker-related requests", fa: "افزودن بررسی صحیح آیدی عددی تلگرام برای تمام درخواست‌های مربوط به Worker" },
+                  ],
+                  improved: [
+                      { en: "Only users with approved admin IDs can interact with the bot and access panel data", fa: "فقط کاربرانی که آیدی آن‌ها در لیست ادمین‌ها ثبت شده باشد اجازه دسترسی به ربات و اطلاعات پنل را دارند" },
+                      { en: "Unauthorized users now receive a clear access denied message", fa: "کاربران غیرمجاز اکنون پیام خطای دسترسی مناسب دریافت می‌کنند" },
+                  ],
+                  notes: [
+                      { en: "Security update — recommended for all users", fa: "به‌روزرسانی امنیتی — توصیه‌شده برای تمام کاربران" },
+                  ]
+              },
               "2.5.4": {
                   headline: { en: "Overview Dashboard & Mobile Improvements", fa: "داشبورد نمای کلی و بهبود نمایش در موبایل" },
                   added: [
