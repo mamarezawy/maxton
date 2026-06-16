@@ -1705,6 +1705,15 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const data = cb.data;
 
             if (chatId) {
+                if (!isAuthorized) {
+                    await fetch(`${tgApi}/answerCallbackQuery`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
+                    });
+                    return new Response("OK", { status: 200 });
+                }
+
                 // Get active panel from last login signal
                 const activePanel = getActivePanel();
                 const isRemotePanel = activePanel && !activePanel.isLocal;
@@ -1723,17 +1732,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
 
                 let answerText = null;
-
-                const adminOnlyActions = ["subs_list:", "sub_detail:", "sub_toggle:", "sub_del_init:", "sub_del_confirm:", "sub_add_init", "sub_add_unlimited_skip", "sub_edit_name_init:", "sub_edit_limits_init:", "sub_unlimit_cb:", "sub_reset_traffic:", "sub_extend_init:", "sub_edit_notes_init:", "sub_edit_device_init:", "sub_device_unlimited:", "subs_disabled:", "sub_search_init", "sys_panic_init", "sys_panic_confirm"];
-                const isAdminAction = adminOnlyActions.some(a => data === a || data.startsWith(a));
-                if (isAdminAction && !isAuthorized) {
-                    await fetch(`${tgApi}/answerCallbackQuery`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
-                    });
-                    return new Response("OK", { status: 200 });
-                }
 
                 if (data === "main_menu") {
                     const menu = getMainMenu(activePanel, isAuthorized);
@@ -2144,7 +2142,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const chatId = update.message.chat.id;
             const text = update.message.text.trim();
             
-            if (chatId.toString() === sysConfig.tgChatId.toString() || isAuthorized || (callerId && !isAuthorized)) {
+            if (isAuthorized) {
                 // Get active panel from last login signal
                 const activePanel = getActivePanel();
                 const isRemotePanel = activePanel && !activePanel.isLocal;
@@ -2402,6 +2400,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 // Default message / fallback menu
                 const menu = getMainMenu(activePanel, isAuthorized);
                 await sendOrEdit(chatId, menu.text, menu.kb);
+            } else {
+                await sendOrEdit(chatId, t("access_denied"));
             }
         }
         return new Response("OK", { status: 200 });
