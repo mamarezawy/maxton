@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.5";
+const CURRENT_VERSION = "2.5.6";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -62,6 +62,7 @@ const SYSTEM_DEFAULTS = {
     expiryMs: 0,
     linkedPanels: [],
     hubPanelUrl: "",
+    allowSyncWorker: false,
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -417,22 +418,22 @@ export default {
 
                     if (isClashYaml) {
                         resHeaders.set("Content-Type", "text/yaml; charset=utf-8");
-                        return new Response(buildYamlProfile(clientHost, targetSub, allowInsecure), {
+                        return new Response(await buildYamlProfile(clientHost, targetSub, allowInsecure), {
                             headers: resHeaders
                         });
                     } else if (isSingboxJson) {
                         resHeaders.set("Content-Type", "application/json; charset=utf-8");
-                        return new Response(JSON.stringify(buildSingBoxJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
+                        return new Response(JSON.stringify(await buildSingBoxJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
                             headers: resHeaders
                         });
                     } else if (isClashJson) {
                         resHeaders.set("Content-Type", "application/json; charset=utf-8");
-                        return new Response(JSON.stringify(buildClashJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
+                        return new Response(JSON.stringify(await buildClashJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
                             headers: resHeaders
                         });
                     } else {
                         resHeaders.set("Content-Type", "text/plain; charset=utf-8");
-                        const raw = buildUriProfile(clientHost, targetSub, allowInsecure);
+                        const raw = await buildUriProfile(clientHost, targetSub, allowInsecure);
                         return new Response(safeBtoa(raw), {
                             headers: resHeaders
                         });
@@ -979,7 +980,7 @@ async function handleUsersApi(request, env, ctx) {
 
         if (method === "POST" && !userId) {
             const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, userMode, userPorts } = body;
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts } = body;
             if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
             const newId = crypto.randomUUID();
             const newUser = {
@@ -991,6 +992,7 @@ async function handleUsersApi(request, env, ctx) {
                 notes: notes || "",
                 maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
                 proxyIp: proxyIp || null,
+cleanIp: cleanIp || null,
                 userMode: userMode || null,
                 userPorts: userPorts || null,
                 createdAt: Date.now()
@@ -1016,6 +1018,7 @@ async function handleUsersApi(request, env, ctx) {
             if (body.notes !== undefined) u.notes = body.notes;
             if (body.maxConfigs !== undefined) u.maxConfigs = body.maxConfigs ? parseInt(body.maxConfigs) : null;
             if (body.proxyIp !== undefined) u.proxyIp = body.proxyIp;
+if (body.cleanIp !== undefined) u.cleanIp = body.cleanIp;
             if (body.userMode !== undefined) u.userMode = body.userMode;
             if (body.userPorts !== undefined) u.userPorts = body.userPorts;
             if (body.status !== undefined) {
@@ -2633,15 +2636,15 @@ async function startDataPipe(webSocket, env, ctx) {
 
     async function parseSensorData(bufferData) {
         const view = new Uint8Array(bufferData);
-        let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false;
+        let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false, activeProfile = null;
 
         if (view[0] === 0x00) {
             isModeAlpha = true;
             
             // Validate UUID
             let clientHash = Array.from(view.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
-            let validUUIDs = getAllProfiles().map(p => p.id.replace(/-/g, '').toLowerCase());
-            if (!validUUIDs.includes(clientHash)) return false; // DROP IF INVALID PROFILE
+            activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === clientHash);
+            if (!activeProfile) return false; // DROP IF INVALID PROFILE
             
             activeClientHash = clientHash;
             trackUsage(activeClientHash, 0, env, ctx);
@@ -2666,10 +2669,10 @@ async function startDataPipe(webSocket, env, ctx) {
             for (let i = 0; i < bufferData.byteLength; i++) { if (view[i] === 0x0D && view[i + 1] === 0x0A) { ePos = i; break; } }
             
             let clientHashHex = new TextDecoder().decode(view.slice(0, ePos));
-            let validProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
-            if (!validProfile) return false;
+            activeProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
+            if (!activeProfile) return false;
             
-            activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
+            activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
             trackUsage(activeClientHash, 0, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
@@ -2707,7 +2710,13 @@ async function startDataPipe(webSocket, env, ctx) {
             remoteSocket = connect({ hostname: connectAddr, port: targetPort });
             await remoteSocket.opened;
         } catch {
-            const fallbackIp = sysConfig.backupRelay || ["pro", "xy", "ip.cmliussss.net"].join("");
+            let fallbackIp = sysConfig.backupRelay || ["pro", "xy", "ip.cmliussss.net"].join("");
+            if (activeProfile && activeProfile.proxyIp) {
+                let list = activeProfile.proxyIp.split(',').map(s => s.trim()).filter(Boolean);
+                if (list.length > 0) {
+                    fallbackIp = list[Math.floor(Math.random() * list.length)];
+                }
+            }
             try {
                 const [altIP, altPortStr] = fallbackIp.split(":");
                 remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
@@ -2830,11 +2839,86 @@ function buildSingleUri(hostName) {
     return `${uriProto}://${activeDeviceId}@${finalIP}:${firstPort}?${ext}#${finalHost}`;
 }
 
-function getConfigName(type, profileName, port, hostName, ip) {
+
+function getProxyIpsArray(proxyIpString) {
+    if (!proxyIpString) return [];
+    return proxyIpString.split(/[\r\n,;]+/).map(s => {
+        let trimmed = s.trim();
+        if (!trimmed) return "";
+        let hostPort = trimmed.split('#')[0].split('@')[0];
+        if (hostPort.includes(':') && !hostPort.includes(']')) {
+            return hostPort.split(':')[0];
+        } else if (hostPort.startsWith('[') && hostPort.includes(']')) {
+            return hostPort.split(']')[0].replace('[', '');
+        }
+        return hostPort;
+    }).filter(Boolean);
+}
+
+const ipFlagCache = new Map();
+async function preloadIpFlags(profiles, hostNames) {
+    let uniqueIps = new Set();
+    profiles.forEach(p => {
+        hostNames.forEach(h => {
+            getCleanIps(h, p.cleanIp).forEach(ip => uniqueIps.add(ip));
+        });
+        if (p.proxyIp) {
+            getProxyIpsArray(p.proxyIp).forEach(ip => uniqueIps.add(ip));
+        }
+    });
+    if (sysConfig.backupRelay) {
+        getProxyIpsArray(sysConfig.backupRelay).forEach(ip => uniqueIps.add(ip));
+    }
+    
+    let promises = Array.from(uniqueIps).map(async ip => {
+        if (ipFlagCache.has(ip)) return;
+        try {
+            let cleanIp = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
+            const res = await fetch(`http://ip-api.com/json/${cleanIp}?fields=countryCode`);
+            const data = await res.json();
+            if (data && data.countryCode) {
+                const codePoints = data.countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
+                ipFlagCache.set(ip, String.fromCodePoint(...codePoints));
+                return;
+            }
+        } catch(e) {}
+        ipFlagCache.set(ip, "🌐");
+    });
+    await Promise.all(promises);
+}
+
+function getEmojiFlag(ip) {
+    if (!ip) return "🌐";
+    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
+    return ipFlagCache.get(ip) || ipFlagCache.get(clean) || "🌐";
+}
+
+function getConfigName(type, profileName, port, hostName, ip, proxyIp = null) {
     let prefix = sysConfig.namePrefix || "Core";
     let strategy = sysConfig.nameStrategy || "default";
     let cleanName = profileName === "Default" ? "" : `-${profileName}`;
     let typeLab = type === "alpha" ? "V" : "T";
+    
+    if (strategy.includes('{') && strategy.includes('}')) {
+        let lookupIp = ip;
+        if (proxyIp) {
+            let pips = getProxyIpsArray(proxyIp);
+            if (pips.length > 0) lookupIp = pips[0];
+        } else if (sysConfig.backupRelay) {
+            let pips = getProxyIpsArray(sysConfig.backupRelay);
+            if (pips.length > 0) lookupIp = pips[0];
+        }
+        let flagEmoji = getEmojiFlag(lookupIp);
+        let protoLab = type === "alpha" ? "VLESS" : "Trojan";
+        let resName = strategy
+            .replace(/{FLAG}/g, flagEmoji)
+            .replace(/{PROTOCOL}/g, protoLab)
+            .replace(/{USER}/g, profileName)
+            .replace(/{PORT}/g, port)
+            .replace(/{PREFIX}/g, prefix)
+            .replace(/{IP}/g, ip || '');
+        return resName;
+    }
     
     if (strategy === "type-user-port") {
         return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${profileName}-${port}`;
@@ -2846,8 +2930,8 @@ function getConfigName(type, profileName, port, hostName, ip) {
         return `${prefix}${cleanName}-${port}`;
     } 
     else if (strategy === "ip") {
-    return ip || 'unknown';
-}
+        return ip || 'unknown';
+    }
     
     else { // "default"
         return `${typeLab}-Core-${port}${cleanName}`;
@@ -2863,7 +2947,7 @@ function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
     return ips.slice(0, neededIps);
 }
 
-function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
+async function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
     if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     
@@ -2872,6 +2956,7 @@ function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     
     let lines = [];
     let profiles = getAllProfiles(targetSub);
+    await preloadIpFlags(profiles, allHostNames);
     
     // Add fake configs
     let stats = getSubscriptionStats(targetSub);
@@ -2880,12 +2965,18 @@ function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     lines.push(fakeU1, fakeU2);
     
     profiles.forEach(p => {
+        let pips = getProxyIpsArray(p.proxyIp);
+        if (pips.length === 0 && sysConfig.backupRelay) {
+            pips = getProxyIpsArray(sysConfig.backupRelay);
+        }
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
+        let configIndex = 0;
+
         allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+            let allIps = getCleanIps(hName, p.cleanIp);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port);
@@ -2893,8 +2984,13 @@ function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
                 ips.forEach(ip => {
-                    let vName = getConfigName("alpha", p.name, port, hName, ip);
-                    let tName = getConfigName("beta", p.name, port, hName, ip);
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
+                    let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
+                    let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp);
+                    configIndex++;
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
                         lines.push(`${getAlpha()}://${p.id}@${ip}:${port}?${extBase}#${vName}`);
                     }
@@ -2908,7 +3004,7 @@ function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     return lines.join('\n');
 }
 
-function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
+async function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
     if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     
@@ -2917,6 +3013,7 @@ function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     let proxyNames = [];
     let nameCounts = {}; // Track proxy names for deduplication
     let profiles = getAllProfiles(targetSub);
+    await preloadIpFlags(profiles, allHostNames);
 
     // Add fake configs
     let stats = getSubscriptionStats(targetSub);
@@ -2942,18 +3039,28 @@ function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     };
 
     profiles.forEach(p => {
+        let pips = getProxyIpsArray(p.proxyIp);
+        if (pips.length === 0 && sysConfig.backupRelay) {
+            pips = getProxyIpsArray(sysConfig.backupRelay);
+        }
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
+        let configIndex = 0;
+
         allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+            let allIps = getCleanIps(hName, p.cleanIp);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls" ? "true" : "false";
                 ips.forEach(ip => {
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let vName = getConfigName("alpha", p.name, port, hName, ip);
+                        let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
                         vName = getUniqueName(vName);
                         proxyNames.push(`"${vName}"`);
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
@@ -2962,7 +3069,7 @@ function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
                         proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
                     if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let tName = getConfigName("beta", p.name, port, hName, ip);
+                        let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp);
                         tName = getUniqueName(tName);
                         proxyNames.push(`"${tName}"`);
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
@@ -2970,6 +3077,7 @@ function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
                         proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
+                    configIndex++;
                 });
             });
         });
@@ -3082,11 +3190,12 @@ function getIpTypeLabel(ip) {
     return "Domain";
 }
 
-function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
+async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
     if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
+    await preloadIpFlags(profiles, allHostNames);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
 
     let proxiesArr = [];
@@ -3133,21 +3242,31 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
     };
 
     profiles.forEach(p => {
+        let pips = getProxyIpsArray(p.proxyIp);
+        if (pips.length === 0 && sysConfig.backupRelay) {
+            pips = getProxyIpsArray(sysConfig.backupRelay);
+        }
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
+        let configIndex = 0;
+
         allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+            let allIps = getCleanIps(hName, p.cleanIp);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls";
                 ips.forEach(ip => {
                     let isVless = effectiveMode === "alpha" || effectiveMode === "both";
                     let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
 
                     if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip);
+                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
                         
@@ -3190,7 +3309,7 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
                     }
 
                     if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip);
+                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -3231,6 +3350,7 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
                         }
                         proxiesArr.push(ob);
                     }
+                    configIndex++;
                 });
             });
         });
@@ -3370,11 +3490,12 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
     };
 }
 
-function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false) {
+async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
     if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
+    await preloadIpFlags(profiles, allHostNames);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
 
     let outboundsArr = [];
@@ -3411,21 +3532,31 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
     };
 
     profiles.forEach(p => {
+        let pips = getProxyIpsArray(p.proxyIp);
+        if (pips.length === 0 && sysConfig.backupRelay) {
+            pips = getProxyIpsArray(sysConfig.backupRelay);
+        }
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
+        let configIndex = 0;
+
         allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+            let allIps = getCleanIps(hName, p.cleanIp);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls";
                 ips.forEach(ip => {
                     let isVless = effectiveMode === "alpha" || effectiveMode === "both";
                     let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
 
                     if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip);
+                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -3466,7 +3597,7 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                     }
 
                     if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip);
+                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -3504,6 +3635,7 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                         };
                         outboundsArr.push(ob);
                     }
+                    configIndex++;
                 });
             });
         });
@@ -4172,7 +4304,7 @@ function getDashboardUI(hasDB) {
                               <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider mb-3 md:mb-4" data-i18n="ov_quick_actions">Quick Actions</h3>
                                   <div class="grid grid-cols-2 gap-2 md:grid-cols-1 md:gap-3">
-                                      <button onclick="document.getElementById('modal-add-user').classList.remove('hidden'); buildPortCheckboxes('add-user-ports-wrap', null); buildModeCheckboxes('add-user-mode-wrap', null);" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
+                                      <button onclick="openAddUserModal()" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
                                           <span data-i18n="ov_add_user">Add User</span>
                                       </button>
@@ -4414,6 +4546,10 @@ function getDashboardUI(hasDB) {
                               </div>
                               <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
                               <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">Put one IP per line. The Sync URL will multiply configs for all IPs.</p>
+                              <button id="btn-resolve-smart-ips" onclick="resolveSmartCleanIps()" class="mt-3 w-full sm:w-auto px-4 py-2.5 bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
+                                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                  Auto-Resolve CDN & Clean IPs
+                              </button>
                           </div>
                           
                           <!-- Slave Nodes Section -->
@@ -4464,8 +4600,8 @@ function getDashboardUI(hasDB) {
                                   <input type="text" id="cfg-fake" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                               </div>
                               <div class="space-y-1 md:col-span-2 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_relay">Backup Relay IP</label>
-                                  <input type="text" id="cfg-relay" placeholder="proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_relay">Proxy IPs (Comma/Newline separated)</label>
+                                  <textarea id="cfg-relay" rows="3" placeholder="104.20.0.1\nproxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
                               </div>
                           </div>
   
@@ -4473,14 +4609,10 @@ function getDashboardUI(hasDB) {
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_strategy">Configuration Name Strategy</label>
-                                  <select id="cfg-name-strategy" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
-                                      <option value="default">Default Core Name (e.g. V-Core-443-User)</option>
-                                      <option value="type-user-port">Protocol-User-Port (e.g. vless-User-443)</option>
-                                      <option value="user-port">User-Port (e.g. User-443)</option>
-                                      <option value="host-port-user">Hostname-Port-User</option>
-                                      <option value="prefix-user-port">Custom Prefix-User-Port</option>
-                                      <option value="ip">IP(x.x.x.x)</option>
-                                  </select>
+                                  <input type="text" id="cfg-name-strategy" placeholder="{FLAG} {PROTOCOL}-{USER}-{PORT}" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                  <p data-i18n="html_desc_strategy" class="text-[11px] text-slate-400 dark:text-slate-500 mt-1 px-1 leading-relaxed">
+                                      Supported pre-defined templates: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">default</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">type-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">host-port-user</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">prefix-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">ip</code>.
+                                  </p>
                               </div>
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_prefix">Custom Name Prefix</label>
@@ -4645,7 +4777,7 @@ function getDashboardUI(hasDB) {
                                           <option value="auto-disabled" data-i18n="filter_auto_disabled">Auto-Disabled</option>
                                       </select>
                                       <input type="text" id="user-search-input" onkeyup="renderUsersTable()" placeholder="🔍 Find by Name or UUID..." data-i18n="user_search_placeholder" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
-                                      <button onclick="document.getElementById('modal-add-user').classList.remove('hidden'); buildPortCheckboxes('add-user-ports-wrap', null); buildModeCheckboxes('add-user-mode-wrap', null);" class="px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm" data-i18n="btn_add_user">+ Add New User</button>
+                                      <button onclick="openAddUserModal()" class="px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm" data-i18n="btn_add_user">+ Add New User</button>
                                   </div>
                               </div>
                               <div class="overflow-x-auto">
@@ -4691,9 +4823,12 @@ function getDashboardUI(hasDB) {
                                           <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                       </div>
                                       <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ipproxy">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
-                                          <input type="text" id="add-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
+    <label class="block text-xs font-bold text-slate-500 mb-1">Select Clean IPs</label>
+    <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+ </div>
+ <div>
+    <label class="block text-xs font-bold text-slate-500 mb-1">Select Proxy IPs</label>
+ </div>
                                       <div>
                                           <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
                                           <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
@@ -4746,9 +4881,13 @@ function getDashboardUI(hasDB) {
                                           <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                       </div>
                                       <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
-                                          <input type="text" id="edit-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
+    <label class="block text-xs font-bold text-slate-500 mb-1">Select Clean IPs</label>
+    <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+ </div>
+ <div>
+    <label class="block text-xs font-bold text-slate-500 mb-1">Select Proxy IPs</label>
+    <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+ </div>
                                       <div>
                                           <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
                                           <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
@@ -4940,6 +5079,7 @@ function getDashboardUI(hasDB) {
                    lbl_cf_worker: "CF Worker Script Name", desc_cf_worker: "Required for in-panel updates. The script name shown in your Cloudflare Workers dashboard.",
                    view_github: "View on GitHub",
                    update_requires_cf: "Set CF Account ID, API Token, and Worker Name to enable in-panel deploy.",
+                   html_desc_strategy: "Supported placeholders: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: Country flag emoji (e.g. 🇺🇸).<br>• <b>{PROTOCOL}</b>: Core mode (VLESS / Trojan).<br>• <b>{USER}</b>: Subscriber name.<br>• <b>{PORT}</b>: Active port.<br>• <b>{PREFIX}</b>: Custom prefix.<br>• <b>{IP}</b>: Clean IP address.</span><br>Pre-defined strategies: <code>default</code>, <code>type-user-port</code>, <code>user-port</code>, <code>host-port-user</code>, <code>prefix-user-port</code>, <code>ip</code>.",
                },
               fa: {
                   title: "دروازه نهان", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای پایگاه داده یافت نشد! تنظیمات ذخیره نمی‌شوند.",
@@ -4992,10 +5132,26 @@ function getDashboardUI(hasDB) {
                       lbl_cf_worker: "نام اسکریپت کارگر ابری", desc_cf_worker: "برای بروزرسانی خودکار الزامی است. نام اسکریپت در داشبورد کارگرهای ابری.",
                       view_github: "مشاهده در گیت‌هاب",
                      update_requires_cf: "برای نصب خودکار، شناسه اکانت، توکن API و نام کارگر را تنظیم کنید.",
+                     html_desc_strategy: "متغیرهای پشتیبانی شده: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: ایموجی پرچم مربوط به کشور آی‌پی لبه (مثلاً 🇺🇸).<br>• <b>{PROTOCOL}</b>: پروتکل اصلی هسته (VLESS / Trojan).<br>• <b>{USER}</b>: نام یا شناسه مشترک ساب.<br>• <b>{PORT}</b>: پورت فعال اتصال.<br>• <b>{PREFIX}</b>: پیشوند نام دلخواه.<br>• <b>{IP}</b>: آدرس آی‌پی تمیز.</span><br>طرح‌های از پیش تعریف شده: <code>default</code>، <code>type-user-port</code>، <code>user-port</code>، <code>host-port-user</code>، <code>prefix-user-port</code>، <code>ip</code>.",
                 }
           };
 
           const CHANGELOG_DATA = {
+              "2.5.6": {
+                  headline: { en: "Multiple Proxy IPs & Flag Matching", fa: "آی‌پی‌های پروکسی متعدد و انطباق پرچم" },
+                  added: [
+                      { en: "Support multi-proxy IP lists (rotated/distributed across generated configs to bypass Cloudflare limits)", fa: "پشتیبانی از لیست‌های آی‌پی پروکسی چندگانه (چرخش و توزیع خودکار میان کانفیگ‌ها برای عبور از محدودیت‌های کلودفلر)" },
+                      { en: "Proper country flag matching for configs based on the actual proxy IP used", fa: "انطباق صحیح پرچم کشور برای کانفیگ‌ها بر اساس آی‌پی پروکسی واقعی استفاده‌شده" }
+                  ],
+                  fixed: [
+                      { en: "Fixed outbound transport and websocket configurations formatting errors", fa: "رفع خطاهای فرمت‌دهی در کانفیگ‌های حمل و نقل خروجی و وب‌ساکت" }
+                  ],
+                  improved: [
+                      { en: "Distributed multiple proxy IPs evenly across subscription sub-configs", fa: "توزیع یکنواخت چندین آی‌پی پروکسی میان زیرکانفیگ‌های اشتراک" },
+                      { en: "Enhanced IP API resolving and flag caching logic", fa: "بهبود منطق حل‌وفصل و کش پرچم برای آی‌پی‌ها" }
+                  ],
+                  notes: []
+              },
               "2.5.5": {
                   headline: { en: "One-Click Panel Update", fa: "بروزرسانی پنل با یک کلیک" },
                   added: [
@@ -5224,7 +5380,11 @@ function getDashboardUI(hasDB) {
                       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
                           el.placeholder = i18n[lang][key];
                       } else {
-                          el.innerText = i18n[lang][key];
+                          if (key.startsWith('html_')) {
+                              el.innerHTML = i18n[lang][key];
+                          } else {
+                              el.innerText = i18n[lang][key];
+                          }
                       }
                   }
               });
@@ -6048,7 +6208,47 @@ function getDashboardUI(hasDB) {
               return (window.nahanConfig && window.nahanConfig.mode) ? window.nahanConfig.mode : 'alpha';
           }
 
-          function buildPortCheckboxes(wrapId, selectedPorts) {
+          function openAddUserModal() {
+              document.getElementById('modal-add-user').classList.remove('hidden');
+              buildPortCheckboxes('add-user-ports-wrap', null);
+              buildModeCheckboxes('add-user-mode-wrap', null);
+              buildIPCheckboxes("add-user-clean-ips-wrap", "", (window.nahanConfig?.cleanIps||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean));
+          }
+
+          
+function buildIPCheckboxes(wrapId, selectedIps, allIps) {
+    const wrap = document.getElementById(wrapId);
+    if(!wrap) return;
+    wrap.innerHTML = '';
+    if(!allIps || allIps.length === 0) {
+        wrap.innerHTML = '<span class="text-xs text-slate-400">No IPs added in Advanced Tab</span>';
+        return;
+    }
+    const selArr = selectedIps ? selectedIps.split(',').map(s=>s.trim()).filter(Boolean) : [];
+    allIps.forEach(ip => {
+        const lbl = document.createElement('label');
+        lbl.className = "flex items-center gap-1.5 text-sm cursor-pointer border border-slate-200 dark:border-darkborder px-2 py-1 rounded-lg";
+        const cb = document.createElement('input');
+        cb.type = "checkbox";
+        cb.className = "accent-primary";
+        cb.value = ip;
+        if(selArr.includes(ip)) cb.checked = true;
+        
+        lbl.appendChild(cb);
+        const span = document.createElement('span');
+        span.innerText = ip;
+        lbl.appendChild(span);
+        wrap.appendChild(lbl);
+    });
+}
+function getSelectedCheckboxes(wrapId) {
+    const wrap = document.getElementById(wrapId);
+    if(!wrap) return '';
+    const checked = Array.from(wrap.querySelectorAll('input:checked')).map(cb => cb.value);
+    return checked.join(',');
+}
+
+function buildPortCheckboxes(wrapId, selectedPorts) {
               const wrap = document.getElementById(wrapId);
               if (!wrap) return;
               const globalPorts = getGlobalPorts();
@@ -6092,7 +6292,7 @@ function getDashboardUI(hasDB) {
               let dReq = document.getElementById('add-user-daily-reqs').value;
               dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
               let days = document.getElementById('add-user-days').value;
-              const proxyIp = document.getElementById('add-user-proxy-ip').value || null;
+const cleanIp = getSelectedCheckboxes("add-user-clean-ips-wrap") || null;
               const userMode = readModeFromCheckboxes('add-mode-cb');
               const userPorts = readPortsFromCheckboxes('add-user-ports-wrap');
               let maxConfigs = document.getElementById('add-user-max-configs').value;
@@ -6125,6 +6325,7 @@ function getDashboardUI(hasDB) {
                    limitDailyReq: dReq,
                    expiryMs: days ? Date.now() + days*86400000 : null,
                    proxyIp: proxyIp,
+cleanIp: cleanIp,
                    userMode: userMode,
                    userPorts: userPorts,
                    maxConfigs: maxConfigs,
@@ -6137,7 +6338,6 @@ function getDashboardUI(hasDB) {
               document.getElementById('add-user-total-reqs').value = '';
               document.getElementById('add-user-daily-reqs').value = '';
               document.getElementById('add-user-days').value = '';
-              document.getElementById('add-user-proxy-ip').value = '';
               document.getElementById('add-user-max-configs').value = '';
               
               renderUsersTable();
@@ -6153,7 +6353,8 @@ function getDashboardUI(hasDB) {
               document.getElementById('edit-user-name').value = u.name;
               document.getElementById('edit-user-total-reqs').value = u.limitTotalReq? (u.limitTotalReq / 6000).toFixed(2): '';
               document.getElementById('edit-user-daily-reqs').value = u.limitDailyReq? (u.limitDailyReq / 6000).toFixed(2): '';
-              document.getElementById('edit-user-proxy-ip').value = u.proxyIp || '';
+              buildIPCheckboxes("edit-user-proxy-ips-wrap", u.proxyIp || "", (window.nahanConfig?.backupRelay||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean));
+              buildIPCheckboxes("edit-user-clean-ips-wrap", u.cleanIp || "", (window.nahanConfig?.cleanIps||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean));
               document.getElementById('edit-user-max-configs').value = u.maxConfigs || '';
               
               buildPortCheckboxes('edit-user-ports-wrap', u.userPorts);
@@ -6177,7 +6378,8 @@ function getDashboardUI(hasDB) {
               let dReq = document.getElementById('edit-user-daily-reqs').value;
               dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
               let days = document.getElementById('edit-user-days').value;
-              const proxyIp = document.getElementById('edit-user-proxy-ip').value || null;
+              const proxyIp = getSelectedCheckboxes("edit-user-proxy-ips-wrap") || null;
+const cleanIp = getSelectedCheckboxes("edit-user-clean-ips-wrap") || null;
               const userMode = readModeFromCheckboxes('edit-mode-cb');
               const userPorts = readPortsFromCheckboxes('edit-user-ports-wrap');
               let maxConfigs = document.getElementById('edit-user-max-configs').value;
@@ -6206,6 +6408,7 @@ function getDashboardUI(hasDB) {
               u.limitDailyReq = dReq;
               u.expiryMs = days ? Date.now() + days*86400000 : null;
               u.proxyIp = proxyIp;
+u.cleanIp = cleanIp;
               u.userMode = userMode;
               u.userPorts = userPorts;
               u.maxConfigs = maxConfigs;
@@ -6233,6 +6436,80 @@ function getDashboardUI(hasDB) {
               btn.innerText = origText;
           }
 
+          async function resolveSmartCleanIps() {
+              const btn = document.getElementById('btn-resolve-smart-ips');
+              const origText = btn.innerHTML;
+              btn.disabled = true;
+              btn.innerHTML = '⚡ Resolving CDN & Clean IPs...';
+              
+              const domains = [
+                  'www.speedtest.net',
+                  'grok.com',
+                  'feedback.spotify.com',
+                  'www.hcaptcha.com',
+                  'chatgpt.com',
+                  'sourceforge.net',
+                  'snapp.ir',
+                  'digikala.com',
+                  'divar.ir',
+                  'cafebazaar.ir',
+                  'shaparak.ir',
+                  'aparat.com',
+                  'soft98.ir',
+                  'varzesh3.com'
+              ];
+              
+              let resolvedIps = new Set();
+              const cleanIpsTextarea = document.getElementById('cfg-ips');
+              
+              async function resolveOne(domain) {
+                  try {
+                      const res = await fetch(\`https://cloudflare-dns.com/dns-query?name=\${encodeURIComponent(domain)}&type=A\`, { 
+                          headers: { 'accept': 'application/dns-json' }
+                      });
+                      const data = await res.json();
+                      if (data && data.Answer) {
+                          data.Answer.forEach(ans => {
+                              if (ans.type === 1 && ans.data) {
+                                  resolvedIps.add(ans.data);
+                              }
+                          });
+                      }
+                  } catch(e) {
+                      try {
+                          const res = await fetch(\`https://dns.google/resolve?name=\${encodeURIComponent(domain)}&type=A\`);
+                          const data = await res.json();
+                          if (data && data.Answer) {
+                              data.Answer.forEach(ans => {
+                                  if (ans.type === 1 && ans.data) {
+                                      resolvedIps.add(ans.data);
+                                  }
+                              });
+                          }
+                      } catch(ge) {}
+                  }
+              }
+              
+              try {
+                  await Promise.all(domains.map(d => resolveOne(d)));
+              } catch(err) {
+                  console.error("DNS resolving process encountered an issue:", err);
+              }
+              
+              if (resolvedIps.size > 0) {
+                  const ipList = Array.from(resolvedIps).join('\\n');
+                  cleanIpsTextarea.value = ipList;
+                  cleanIpsTextarea.dispatchEvent(new Event('input'));
+                  cleanIpsTextarea.dispatchEvent(new Event('change'));
+                  alert('Successfully resolved and loaded ' + resolvedIps.size + ' clean IPs!');
+              } else {
+                  alert('Failed to resolve domains to IPs. Please verify your internet connection or custom DNS.');
+              }
+              
+              btn.disabled = false;
+              btn.innerHTML = origText;
+          }
+
           async function checkUpdate() {
               try {
                   const res = await fetch(baseRoute + '/api/update', {
@@ -6243,7 +6520,7 @@ function getDashboardUI(hasDB) {
                   const data = await res.json();
                   if (data.success && data.updateAvailable) {
                       window._updateData = data;
-                      showUpdateBanner((document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace(/https?:\\/\\/github\\.com\\//, '').trim(), data.latest);
+                      showUpdateBanner((document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim(), data.latest);
                   }
                   if (data.success && !data.canDeploy) {
                       const statusEl = document.getElementById('update-deploy-status');
