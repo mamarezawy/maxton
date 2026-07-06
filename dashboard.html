@@ -2399,6 +2399,8 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
               if(activeTab) document.getElementById('view-title').innerText = activeTab.innerText;
           }
 
+          let dashboardInterval = null;
+          let networkInterval = null;
           function switchTab(tab) {
             ['overview','info','network','settings','advanced','logs','users','help'].forEach(t => {
                   const view = document.getElementById('view-'+t);
@@ -2406,25 +2408,38 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                   const mobBtn = document.getElementById('mob-tab-'+t);
                   if (tab === t) {
                       view.classList.remove('hidden'); view.classList.add('block', 'fade-in');
-                      deskBtn.classList.add('active'); mobBtn.classList.add('active');
+                      if(deskBtn) deskBtn.classList.add('active');
+                      if(mobBtn) mobBtn.classList.add('active');
                   } else {
                       view.classList.add('hidden'); view.classList.remove('block', 'fade-in');
-                      deskBtn.classList.remove('active'); mobBtn.classList.remove('active');
+                      if(deskBtn) deskBtn.classList.remove('active');
+                      if(mobBtn) mobBtn.classList.remove('active');
                   }
               });
             document.getElementById('view-add-user').classList.add('hidden');
             document.getElementById('view-edit-user').classList.add('hidden');
             var sc = document.querySelector('.scroll-content');
-            sc.style.overflow = '';
-            sc.classList.remove('flex', 'flex-col');
-            sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
+            if (sc) {
+                sc.style.overflow = '';
+                sc.classList.remove('flex', 'flex-col');
+                if (sc.firstElementChild) sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
+                sc.scrollTop = 0;
+            }
             updateTitle();
-            var sc = document.querySelector('.scroll-content');
-            if (sc) sc.scrollTop = 0;
-            if(tab === 'overview') loadDashboard();
+            
+            if(dashboardInterval) { clearInterval(dashboardInterval); dashboardInterval = null; }
+            if(networkInterval) { clearInterval(networkInterval); networkInterval = null; }
+            
+            if(tab === 'overview') {
+                loadDashboard();
+                dashboardInterval = setInterval(loadDashboard, 15000);
+            }
             if(tab === 'logs') loadLogs();
-            if(tab === 'network') doLogin(true); // refresh metrics
-        }
+            if(tab === 'network') {
+                doLogin(true);
+                networkInterval = setInterval(()=>doLogin(true), 15000);
+            }
+          }
 
         function toggleFAQ(button) {
             const content = button.nextElementSibling;
@@ -2498,7 +2513,23 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                     document.getElementById('ov-today-traffic').textContent = s.traffic.dailyGB + ' ' + (i18n[lang]?.ov_gb_unit || 'GB');
                     document.getElementById('ov-today-reqs').textContent = s.traffic.dailyRequests.toLocaleString();
                     document.getElementById('ov-active-conns').textContent = s.system.activeConnections;
+                    
                     document.getElementById('ov-version').textContent = 'v' + s.system.version;
+                    
+                    const usageCont = document.getElementById('usage-metrics-container');
+                    if(usageCont && statsData.stats.usage && window.nahanProfiles) {
+                        let usageHtml = '';
+                        window.nahanProfiles.forEach(p => {
+                            let hash = p.id.replace(/-/g, '').toLowerCase();
+                            let use = statsData.stats.usage[hash];
+                            if(use) {
+                                let timeStr = new Date(use.last).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+                                usageHtml += `<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">${p.name}</span><span class="text-[10px] text-slate-400 font-mono">${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">${use.connects} Conns</span><span class="text-[10px] text-slate-400">${timeStr}</span></div></div>`;
+                            }
+                        });
+                        if(usageHtml) usageCont.innerHTML = usageHtml;
+                    }
+
                 }
 
                 const actList = document.getElementById('ov-activity-list');
