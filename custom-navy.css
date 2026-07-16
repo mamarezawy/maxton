@@ -1,0 +1,138 @@
+/* ============================================================
+   LeGocy custom theme patch
+   - Overrides the default dark palette with a navy scheme
+   - Adds hover motion/effects to icons, cards, nav, buttons
+   - Hides the Help & FAQ tab
+   Load this AFTER the page's own <style> block (right before </head>)
+   so these rules win the cascade.
+   ============================================================ */
+
+/* ---------- 1. Navy color palette (replaces default dark theme) ---------- */
+html.dark {
+    --color-text: #e6ecff;
+    --color-text-muted: #93a3c9;
+    --color-primary: #38bdf8;
+    --color-primary-hover: #0ea5e9;
+    --color-bg: var(--slate-900);
+    --color-surface: var(--slate-800);
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+
+    --slate-50: #060b1c;
+    --slate-100: #0d1730;
+    --slate-200: #16234a;
+    --slate-300: #c7d2f0;
+    --slate-400: #93a3c9;
+    --slate-500: #38bdf8;
+    --slate-600: #60a5fa;
+    --slate-700: #c7d2f0;
+    --slate-800: #0d1730;
+    --slate-900: #060b1c;
+}
+
+/* ---------- 2. Ambient background glow ---------- */
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background:
+        radial-gradient(circle at 10% 10%, color-mix(in srgb, var(--color-primary) 6%, transparent) 0%, transparent 40%),
+        radial-gradient(circle at 90% 90%, color-mix(in srgb, var(--color-primary) 5%, transparent) 0%, transparent 40%);
+}
+
+/* ---------- 3. Page-load fade for each view ---------- */
+#view-overview, #view-info, #view-network, #view-settings,
+#view-advanced, #view-logs, #view-users {
+    animation: legocyFadeInUp .45s ease both;
+}
+@keyframes legocyFadeInUp {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------- 4. Icon hover motion ---------- */
+svg {
+    transition: transform .25s cubic-bezier(.34,1.56,.64,1), filter .25s ease;
+}
+button:hover svg, a:hover svg, .nav-item:hover svg {
+    transform: scale(1.15) rotate(-4deg);
+    filter: drop-shadow(0 0 6px color-mix(in srgb, var(--color-primary) 55%, transparent));
+}
+
+/* ---------- 5. Card hover lift ---------- */
+.native-press,
+main .rounded-2xl,
+main .rounded-3xl,
+[data-accordion] {
+    transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease !important;
+}
+.native-press:hover,
+main .rounded-2xl:hover,
+main .rounded-3xl:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 12px 30px color-mix(in srgb, var(--color-primary) 18%, transparent) !important;
+    border-color: color-mix(in srgb, var(--color-primary) 40%, transparent) !important;
+}
+
+/* ---------- 6. Sidebar nav motion ---------- */
+.nav-item {
+    position: relative;
+    overflow: hidden;
+    transition: background .2s ease, color .2s ease, transform .2s ease;
+}
+.nav-item:hover {
+    background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+    color: var(--color-primary) !important;
+    transform: translateX(4px);
+}
+.nav-item.active {
+    background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+    color: var(--color-primary) !important;
+}
+.nav-item.active::before {
+    content: "";
+    position: absolute;
+    inset-inline-start: 0;
+    top: 10%;
+    bottom: 10%;
+    width: 3px;
+    border-radius: 3px;
+    background: var(--color-primary);
+    box-shadow: 0 0 10px var(--color-primary);
+}
+
+/* ---------- 7. Buttons ---------- */
+button, .login-btn {
+    transition: transform .15s ease, box-shadow .15s ease, filter .15s ease;
+}
+button:hover { filter: brightness(1.08); }
+button:active { transform: scale(.96); }
+
+/* ---------- 8. Toggle switches ---------- */
+input[type="checkbox"].peer ~ div {
+    transition: background-color .25s ease;
+}
+input[type="checkbox"].peer ~ div::after {
+    transition: transform .25s cubic-bezier(.34,1.56,.64,1) !important;
+}
+
+/* ---------- 9. Login screen glow pulse ---------- */
+.lock-pulse {
+    animation: legocyPulseGlow 2.4s ease-in-out infinite;
+}
+@keyframes legocyPulseGlow {
+    0%, 100% { box-shadow: 0 0 40px color-mix(in srgb, var(--color-primary) 25%, transparent); }
+    50%      { box-shadow: 0 0 60px color-mix(in srgb, var(--color-primary) 45%, transparent); }
+}
+#login-box .absolute.pointer-events-none.rounded-full {
+    animation: legocyDrift 10s ease-in-out infinite;
+}
+@keyframes legocyDrift {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    50%      { transform: translate(30px, -20px) scale(1.08); }
+}
+
+/* ---------- 10. Hide the Help & FAQ tab ---------- */
+#tab-help { display: none !important; }
