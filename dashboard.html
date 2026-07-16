@@ -9,7 +9,7 @@
       <meta name="format-detection" content="telephone=no">
       <meta name="msapplication-tap-highlight" content="no">
       <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%236366f1'/><text x='50' y='62' font-size='40' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>N</text></svg>">
-      <title>Nahan Gateway</title>
+      <title>LeGodcy</title>
       <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&amp;display=swap" rel="stylesheet">
       <script src="https://cdn.jsdelivr.net/gh/itsyebekhe/nahan@main/tailwindcss.js"></script>
             <script>
@@ -232,7 +232,56 @@ html[data-theme="dracula"] {
     --slate-800: #282a36;
     --slate-900: #1e1f29;
 }
+/* Navy Theme */
+html[data-theme="navy"] {
+    --color-primary: #38bdf8;
+    --color-primary-hover: #0ea5e9;
+    --color-bg: #060b1c;
+    --color-surface: #0d1730;
+    --color-bg-alt: #0a1128;
+    --color-border: #1e2b52;
+    --color-text: #e6ecff;
+    --color-text-muted: #93a3c9;
 
+    --slate-50: #060b1c;
+    --slate-100: #0d1730;
+    --slate-200: #16234a;
+    --slate-300: #c7d2f0;
+    --slate-400: #93a3c9;
+    --slate-500: #38bdf8;
+    --slate-600: #60a5fa;
+    --slate-700: #c7d2f0;
+    --slate-800: #0d1730;
+    --slate-900: #060b1c;
+}
+
+/* --- Motion / effects layer --- */
+@keyframes navyDrift {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    50% { transform: translate(30px, -20px) scale(1.08); }
+}
+html[data-theme="navy"] #login-box > div[style*="border-radius: 9999px"],
+html[data-theme="navy"] .absolute.pointer-events-none.rounded-full {
+    animation: navyDrift 10s ease-in-out infinite;
+}
+html[data-theme="navy"] .lock-pulse {
+    animation: navyDrift 6s ease-in-out infinite, pulseGlow 2.4s ease-in-out infinite;
+}
+@keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 40px color-mix(in srgb, var(--color-primary) 25%, transparent); }
+    50% { box-shadow: 0 0 60px color-mix(in srgb, var(--color-primary) 45%, transparent); }
+}
+.native-press, .nav-item, .login-btn, .btn-top-bar {
+    transition: transform .18s ease, box-shadow .18s ease, background .18s ease !important;
+}
+.native-press:hover { transform: translateY(-3px); }
+.login-btn:hover { transform: translateY(-2px) scale(1.01); }
+.fade-in { animation: fadeInUp .5s ease both; }
+@keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+        
 html[lang="fa"] body, html[lang="fa"] body *:not(.font-mono) {
     font-family: 'Vazirmatn', sans-serif !important;
 }
@@ -314,7 +363,7 @@ html.dark select option {
                           <svg class="w-9 h-9 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
                       </div>
                   </div>
-                  <h2 class="text-3xl font-black" style="color: var(--color-text);" data-i18n="title">Nahan Gateway</h2>
+                  <h2 class="text-3xl font-black" style="color: var(--color-text);" data-i18n="title">LeGodcy</h2>
                   <p class="text-sm mt-2" style="color: var(--color-text-muted);">Sign in to manage your gateway</p>
               </div>
               <div class="rounded-3xl p-px" style="background: linear-gradient(145deg, color-mix(in srgb, var(--color-primary) 45%, transparent), color-mix(in srgb, var(--color-primary) 8%, transparent) 50%, color-mix(in srgb, var(--color-primary) 30%, transparent)); box-shadow: 0 25px 60px rgba(0,0,0,0.15);">
@@ -355,7 +404,7 @@ html.dark select option {
               <div class="flex items-center p-6 border-b border-slate-100 dark:border-darkborder/50">
                   <div class="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/40 text-primary flex items-center justify-center me-3 shrink-0"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg></div>
                   <div class="flex flex-col">
-                      <h1 class="font-black text-xl leading-none" data-i18n="title">Nahan</h1>
+                      <h1 class="font-black text-xl leading-none" data-i18n="title">LeGodcy</h1>
                       <span id="app-version" class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">v__CURRENT_VERSION__</span>
                   </div>
               </div>
@@ -656,6 +705,7 @@ html.dark select option {
                 <option value="forest">Forest Green</option>
                 <option value="sunset">Sunset Rose</option>
                 <option value="dracula">Dracula (Dark)</option>
+                <option value="navy">Navy (سرمه‌ای)</option>
             </select>
     </div><div class="space-y-1">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_proto">Primary Display Mode</label>
@@ -1520,7 +1570,7 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                               <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
                                   <div>
                                       <h3 class="text-lg font-black text-slate-800 dark:text-white" data-i18n="help_title">Help & Common Questions</h3>
-                                      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1" data-i18n="help_desc">Learn about fields, features, and troubleshooting on your Nahan Gateway.</p>
+                                      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1" data-i18n="help_desc">Learn about fields, features, and troubleshooting on your LeGodcy.</p>
                                   </div>
                                   <!-- Search bar -->
                                   <div class="relative w-full md:w-72">
@@ -1534,12 +1584,12 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                                       <button onclick="toggleFAQ(this)" class="w-full flex items-center justify-between text-start focus:outline-none font-bold text-slate-800 dark:text-slate-200 hover:text-primary transition-colors">
                                           <span class="flex items-center gap-2">
                                               <span class="text-primary text-sm">❓</span>
-                                              <span class="text-sm md:text-base">What is Nahan Gateway? / دروازه نهان چیست؟</span>
+                                              <span class="text-sm md:text-base">What is LeGodcy? / لگادسی چیست؟</span>
                                           </span>
                                           <svg class="w-5 h-5 transform transition-transform duration-200 shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
                                       </button>
                                       <div class="faq-content hidden mt-3 pt-3 border-t border-slate-200/50 dark:border-darkborder/50 text-xs md:text-sm text-slate-600 dark:text-slate-400 space-y-2 leading-relaxed">
-                                          <p><strong>English:</strong> Nahan Gateway is an advanced, high-performance, single-file subscription and proxy manager built directly for Cloudflare Workers. It acts as a gateway to securely distribute configurations (Clash, Sing-box, Trojan, VMess) to clients while concealing the main panel's backend server behind Cloudflare's global edge network.</p>
+                                          <p><strong>English:</strong> LeGodcy is an advanced, high-performance, single-file subscription and proxy manager built directly for Cloudflare Workers. It acts as a gateway to securely distribute configurations (Clash, Sing-box, Trojan, VMess) to clients while concealing the main panel's backend server behind Cloudflare's global edge network.</p>
                                           <p class="border-t border-dashed border-slate-200 dark:border-darkborder/50 pt-2"><strong>فارسی:</strong> دروازه نهان یک سیستم مدیریت اشتراک و پروکسی پیشرفته و تک‌فایلی است که برای کلودفلر ورکرز توسعه یافته است. این سیستم به عنوان یک دروازه عمل می‌کند تا کانفیگ‌ها (Clash, Sing-box, Trojan, VMess) را به صورت امن توزیع کند و سرور اصلی شما را پشت شبکه جهانی کلودفلر پنهان کند.</p>
                                       </div>
                                   </div>
@@ -1824,7 +1874,7 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
               const bindingNames = uniqueBindings.map(b => b.name);
 
               const finalLoaderCode = rawImportsStr + '\n\n' +
-                  '// Nahan Gateway - Obfuscated Loader Context (v2.5.4.2 Optimized)\n' +
+                  '// LeGodcy - Obfuscated Loader Context (v2.5.4.2 Optimized)\n' +
                   'const _0xNahanPayload = "' + hexOutput + '";\n' +
                   'const _0xNahanKey = ' + randKey + ';\n\n' +
                   'const _0xNahanBytes = new Uint8Array((_0xNahanPayload.match(/.{1,2}/g) || []).map(x => parseInt(x, 16) ^ _0xNahanKey));\n' +
@@ -1838,7 +1888,7 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
           const CURRENT_VERSION = "__CURRENT_VERSION__";
           const i18n = {
               en: {
-                  title: "Nahan Gateway", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.", system_online: "System online",
+                  title: "LeGodcy", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.", system_online: "System online",
                   logout: "Disconnect", tab_overview: "Dashboard", tab_info: "Endpoints", tab_status: "Metrics", tab_settings: "System", tab_adv: "Advanced", tab_logs: "Logs", tab_help: "Help & FAQ",
                   qr_title: "Direct Stream Link", badge_multi: "Dual-Core Multiplexed", copy: "Copy", copied: "Copied to clipboard!", sync_link: "Cloud Sync URL", active_id: "Hardware ID",
                   stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
