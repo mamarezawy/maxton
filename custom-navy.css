@@ -136,3 +136,5 @@ input[type="checkbox"].peer ~ div::after {
 
 /* ---------- 10. Hide the Help & FAQ tab ---------- */
 #tab-help { display: none !important; }
+/* Hide the GitHub icon button (top-right) */
+#github-link-btn { display: none !important; }
